@@ -39,7 +39,7 @@ cc-connect 通过 **ACP（Agent Client Protocol）** 与后端通信——它启
 | sessionId → PTY 映射 | 用 ACP sessionId 做会话隔离 |
 | PTY 生命周期管理 | 创建、写入、读取、销毁 |
 | 输出缓冲 | PTY 字节流 → `session/update` 通知 |
-| chat → target 绑定 | allowed_chats 决定 cwd 和 shell（admin 白名单由 cc-connect admin_from 处理） |
+| cwd → target 绑定 | cwd 决定 shell 类型（admin 白名单由 cc-connect admin_from 处理） |
 
 ## 2. 消息入口：从 cc-connect 学到的
 
@@ -133,10 +133,10 @@ ACP session/prompt(     ──stdin──→      查找 sessions["term-{uuid}"]
 ```
 
 **生命周期规则**：
-- `session/new` → 创建 PTY，返回 sessionId
+- `session/new` → **立即创建 PTY 并 spawn shell**，返回 sessionId。用户第一条消息直接写入 PTY，无需 `@term start`
 - `session/prompt` → 查找 sessionId 对应的 PTY，写入用户输入
 - `session/load` → V1 始终返回错误（PTY 不可跨进程恢复），cc-connect 会 fallback 到 `session/new`
-- 用户发 `@term stop` → 作为普通 prompt 进入，acp-pty 内部解析后销毁 PTY
+- 用户发 `@term stop` → 作为普通 prompt 进入，acp-pty 内部解析后销毁 PTY 并清理 session
 - cc-connect 重启 → 子进程被杀，所有 PTY 随之销毁；cc-connect 重新 spawn acp-pty 并调 `session/new`
 
 ## 4. 输出回传：从 cc-connect 学到的
@@ -189,14 +189,41 @@ strip_ansi_escapes()  // 清除颜色/光标控制码
   ↓
 truncate_if_needed()  // 超长输出截断，保留头尾
   ↓
-写入 stdout JSON → cc-connect → IM
+session/update notification → cc-connect → IM
 ```
 
 **与 cc-connect 的分工**：
-- acp-pty 负责：字节流聚合、ANSI 清除、语义截断
+- acp-pty 负责：字节流聚合、ANSI 清除、语义截断、判断"本轮输出结束"
 - cc-connect 负责：消息分片（4000 rune）、流式预览编辑、平台 API 调用
 
 **为什么不在 acp-pty 做消息分片**：cc-connect 已经做了，而且它知道各平台的具体限制。acp-pty 只需要输出合理大小的文本块（≤ 8KB），cc-connect 会处理剩下的。
+
+### session/prompt 的 RPC 返回时机
+
+cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 `EventResult(Done=true)`，finalize IM 消息）。所以 acp-pty 不能立即返回，必须等 PTY 输出稳定后再返回。
+
+```
+write_to_pty("ls -la\n")
+  ↓
+OutputBuffer 持续聚合 PTY 输出
+  ↓ 每次 flush → 发送 session/update notification（流式推送）
+  ↓
+最后一次 flush 后，再等一个 300ms 静默窗口
+  ↓ 确认无新输出
+  ↓
+返回 session/prompt RPC response: {"jsonrpc":"2.0","id":3,"result":{}}
+  ↓
+cc-connect: EventResult(Done=true) → finalize IM 消息
+```
+
+**安全阀：30 秒硬上限**。长命令（`cargo build`、`make`）可能持续输出数分钟。超过 30 秒后强制返回 RPC，后续输出继续通过 notification best-effort 推送（cc-connect 可能显示为新消息）。
+
+| 场景 | 行为 |
+|---|---|
+| 快命令（ls, pwd, cat） | 输出秒完，300ms 静默后返回 |
+| 中等命令（cargo test） | 输出几秒内结束，300ms 静默后返回 |
+| 长命令（cargo build） | 前 30s 输出 + notification 流式推送，30s 时强制返回 RPC，后续 best-effort |
+| 无输出命令（cd, export） | 写入 PTY 后 300ms 无输出，直接返回 |
 
 ## 5. 权限模型：从 cc-connect 学到的
 
@@ -305,7 +332,7 @@ acp-pty/
 │   │   └── send_notification     # session/update 通知
 │   ├── router.rs            # 会话路由
 │   │   ├── SessionRouter     # DashMap<SessionId, Session>
-│   │   └── CommandParser     # @term start/stop/ctrl-c/sessions
+│   │   └── CommandParser     # @term stop/ctrl-c
 │   ├── session.rs           # PTY 会话管理
 │   │   ├── LocalTerminalSession
 │   │   ├── spawn_pty()       # portable-pty 启动 shell
@@ -378,21 +405,25 @@ PTY 执行 ls -la → stdout 输出字节流
 buffer.rs: OutputBuffer 聚合（300ms 静默 / 4KB 上限）
   ↓ strip_ansi() 清除控制码
   ↓
-acp-pty stdout → session/update 通知：
+acp-pty stdout → session/update 通知（可能多条，流式推送）：
   {"jsonrpc":"2.0","method":"session/update",
    "params":{"sessionId":"term-a1b2c3","update":{
      "sessionUpdate":"agent_message_chunk",
      "content":{"type":"text","text":"total 128\ndrwxr-xr-x  12 melo ..."}
    }}}
   ↓
-PTY 输出结束，返回 prompt RPC 响应：
-  {"jsonrpc":"2.0","id":3,"result":{}}
-  ↓
-cc-connect 读取 session/update
+cc-connect 实时处理 notification
   ↓ StreamPreview / UpdateMessage 实时编辑 IM 消息
   ↓ 超长则 splitMessage() 分片
   ↓
-飞书 API → 用户看到结果
+最后一次 buffer flush 后 300ms 无新输出（或 30s 硬上限）
+  ↓
+acp-pty 返回 prompt RPC 响应：
+  {"jsonrpc":"2.0","id":3,"result":{}}
+  ↓
+cc-connect: EventResult(Done=true) → finalize IM 消息
+  ↓
+飞书 API → 用户看到最终结果
 ```
 
 ### 7.3 @term 命令处理
@@ -434,16 +465,14 @@ async fn output_read_loop(session_id: SessionId, reader: PtyReader, buffer: Outp
         select! {
             n = reader.read(&mut buf) => {
                 match n {
-                    Ok(0) => break,  // PTY 关闭（shell 退出）
+                    Ok(0) => break,
                     Ok(n) => buffer.append(&buf[..n]),
                     Err(_) => break,
                 }
             }
             chunk = buffer.next_flush() => {
-                // 300ms 静默超时 或 4KB 上限触发
                 let text = strip_ansi(&chunk);
                 let text = truncate_if_needed(&text, 8192);
-                // 发送 ACP session/update 通知
                 send_notification("session/update", json!({
                     "sessionId": session_id,
                     "update": {
@@ -451,10 +480,11 @@ async fn output_read_loop(session_id: SessionId, reader: PtyReader, buffer: Outp
                         "content": {"type": "text", "text": text}
                     }
                 }));
+                // 通知 PromptTracker：有新输出，重置静默计时器
+                prompt_tracker.notify_output();
             }
         }
     }
-    // shell 退出，发送最后一条通知
     sessions.remove(&session_id);
     send_notification("session/update", json!({
         "sessionId": session_id,
@@ -464,7 +494,27 @@ async fn output_read_loop(session_id: SessionId, reader: PtyReader, buffer: Outp
         }
     }));
 }
+
+// session/prompt 的返回时机由 PromptTracker 控制
+async fn handle_session_prompt(session_id, prompt_text) -> RpcResult {
+    let session = sessions.get(&session_id)?;
+    session.write_to_pty(format!("{}\n", prompt_text));
+
+    // 等待输出稳定：300ms 静默 或 30s 硬上限
+    let tracker = session.prompt_tracker.clone();
+    tracker.wait_for_settle(
+        silence: Duration::from_millis(300),
+        hard_limit: Duration::from_secs(30),
+    ).await;
+
+    Ok(json!({}))
+}
 ```
+
+`PromptTracker` 的逻辑：
+- `notify_output()` — output_read_loop 每次 flush 后调用，重置 300ms 静默计时器
+- `wait_for_settle()` — 阻塞直到 300ms 无新 notify_output，或 30s 硬上限到达
+- `@term ctrl-c` / `@term stop` 命令直接完成 tracker，立即返回 RPC
 
 ## 8. ACP 协议实现
 
@@ -478,7 +528,7 @@ acp-pty 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **ne
 | cc→term | `session/new` | ✅ | 创建 PTY 会话 |
 | cc→term | `session/prompt` | ✅ | 用户输入写入 PTY |
 | cc→term | `session/load` | ✅ | 始终返回 error（PTY 不可恢复） |
-| cc→term | `session/list` | 可选 | 列出活跃 PTY 会话 |
+| cc→term | `session/list` | ✅ | 列出活跃 PTY 会话（替代 @term sessions 命令） |
 | cc→term | `session/set_mode` | 忽略 | 返回空 `{}` |
 | term→cc | `session/update` | ✅ | PTY 输出通知（notification，无 id） |
 
@@ -535,7 +585,7 @@ acp-pty 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **ne
 {"jsonrpc":"2.0","id":3,"result":{}}
 ```
 
-**关键**：`session/prompt` 的 RPC 响应在 PTY 输出结束后才返回。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。
+**关键**：`session/prompt` 的 RPC 响应在 PTY 输出稳定后才返回（300ms 静默超时 或 30s 硬上限）。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。RPC 返回后 cc-connect 触发 `EventResult(Done=true)` finalize IM 消息。
 
 **session/load（始终失败）**
 
@@ -572,7 +622,7 @@ acp-pty 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect �
 
 | 威胁 | 缓解 |
 |---|---|
-| 未授权用户执行命令 | 双层白名单（admin + chat），全部静默丢弃 |
+| 未授权用户执行命令 | cc-connect 侧 allow_from + admin_from 拦截，acp-pty 侧 cwd 白名单 |
 | PTY 逃逸 | portable-pty 在独立进程中运行，不共享 acp-pty 的 fd |
 | 环境变量泄露 | spawn_pty 使用最小化 env，不继承 acp-pty 的全部环境 |
 | 输出注入 IM | strip_ansi 清除控制码，防止在 IM 端渲染异常内容 |
