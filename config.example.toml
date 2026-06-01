@@ -1,0 +1,12 @@
+[targets.dev]
+cwd = "/Users/melo/project"
+shell = "zsh"
+
+[targets.ops]
+cwd = "/opt/services"
+shell = "bash"
+
+[session]
+idle_timeout_secs = 1800
+max_sessions = 16
+max_output_buffer = 65536
