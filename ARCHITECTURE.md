@@ -1,10 +1,12 @@
-# terminal-connect 架构文档
+# acp-pty 架构文档
 
-> 基于 cc-connect 源码研究（Go, `/root/cc-connect`）推导出的 Rust 实现架构
+> ACP 协议到本地 PTY 的翻译层 — cc-connect 生态的 shell 后端
+>
+> 基于 cc-connect 源码研究（Go, `/root/cc-connect`）推导
 
 ## 1. 与 cc-connect 的关系
 
-terminal-connect **不重新实现 IM 协议适配**。cc-connect 已经完成了所有脏活：
+acp-pty **不重新实现 IM 协议适配**。cc-connect 已经完成了所有脏活：
 
 ```
 飞书 / Telegram / Slack / Discord / 企业微信 / LINE / DingTalk / QQ
@@ -12,32 +14,32 @@ terminal-connect **不重新实现 IM 协议适配**。cc-connect 已经完成�
               cc-connect (Go, 已有)
           ┌─────────────┼─────────────┐
           ↓             ↓             ↓
-     Claude Code   terminal-connect  其他 backend
+     Claude Code   acp-pty  其他 backend
      (现有后端)      (本项目)
 ```
 
-cc-connect 通过 **stdio 协议** 与后端通信——它启动一个子进程，用 stdin/stdout 交换 JSON 消息。terminal-connect 要做的就是实现这个 stdio 协议，替代 Claude Code 成为后端。
+cc-connect 通过 **ACP（Agent Client Protocol）** 与后端通信——它启动一个子进程，用 stdin/stdout 交换 **JSON-RPC 2.0** 消息。acp-pty 要做的就是实现 ACP 协议的最小子集，作为 `type = "acp"` agent 接入 cc-connect。
 
 ### cc-connect 已经帮我们做了的事
 
-| 能力 | cc-connect 如何实现 | terminal-connect 是否需要关心 |
+| 能力 | cc-connect 如何实现 | acp-pty 是否需要关心 |
 |---|---|---|
 | IM 协议适配 | 每个平台一个 adapter（WebSocket/Webhook/Polling） | 不需要 |
-| 消息归一化 | 所有平台 → `core.Message` 统一结构 | 不需要，只收 stdin JSON |
-| SessionKey 路由 | `{platform}:{chatID}:{userID}` 格式 | 直接使用，作为会话映射的 key |
+| 消息归一化 | 所有平台 → `core.Message` 统一结构 | 不需要，只收 ACP JSON-RPC |
+| SessionKey 路由 | `{platform}:{chatID}:{userID}` 格式 | 不直接可见，cc-connect 内部路由；acp-pty 用 ACP sessionId |
 | 流式消息编辑 | `PreviewStarter` / `UpdateMessage` 接口 | 不需要，cc-connect 处理 |
 | 消息分片 | 4000 rune 上限自动切割 | 不需要，cc-connect 处理 |
 | 权限第一层 | `allow_from` 在平台层静默丢弃 | 不需要 |
 
-### terminal-connect 只需要实现
+### acp-pty 只需要实现
 
 | 能力 | 说明 |
 |---|---|
-| stdio JSON 协议 | 从 stdin 读消息，向 stdout 写回复 |
-| SessionKey → PTY 映射 | 用 SessionKey 做会话隔离 |
+| ACP 协议子集 | JSON-RPC 2.0 over stdio：`initialize`、`session/new`、`session/prompt` |
+| sessionId → PTY 映射 | 用 ACP sessionId 做会话隔离 |
 | PTY 生命周期管理 | 创建、写入、读取、销毁 |
-| 输出缓冲 | PTY 字节流 → 离散文本块 |
-| 权限第二层 | admin 白名单 + allowed_chats |
+| 输出缓冲 | PTY 字节流 → `session/update` 通知 |
+| chat → target 绑定 | allowed_chats 决定 cwd 和 shell（admin 白名单由 cc-connect admin_from 处理） |
 
 ## 2. 消息入口：从 cc-connect 学到的
 
@@ -66,26 +68,24 @@ engine.handleMessage()  →  异步 dispatch (go p.dispatchMessage)
 路由到后端进程 stdin
 ```
 
-### terminal-connect 的消息入口（本项目实现）
+### acp-pty 的消息入口（本项目实现）
+
+acp-pty 是 cc-connect 的子进程，通过 ACP（JSON-RPC 2.0 over stdio）通信。
 
 ```
-cc-connect stdout → terminal-connect stdin
+cc-connect → acp-pty stdin: JSON-RPC request
   ↓
-逐行读取 JSON
+逐行读取，按 JSON-RPC 2.0 分发：
+  ├── "initialize"       → 握手，返回能力声明
+  ├── "session/new"      → 创建 PTY 会话
+  ├── "session/load"     → 恢复 PTY 会话（V1 直接失败，触发 session/new）
+  ├── "session/prompt"   → 用户输入写入 PTY
+  └── "session/list"     → 列出活跃会话
   ↓
-解析为 IncomingMessage {
-    session_key: String,     // "feishu:oc_abc123:ou_xyz789"
-    user_id:     String,     // "ou_xyz789"
-    user_name:   String,     // "melo"
-    chat_name:   String,     // "dev-group"
-    content:     String,     // "cd ~/project"
-    platform:    String,     // "feishu"
-}
-  ↓
-路由到 SessionRouter
+acp-pty → cc-connect stdout: JSON-RPC response + notifications
 ```
 
-**关键决策**：terminal-connect 是 cc-connect 的子进程，通过 stdin/stdout 通信。不需要监听端口，不需要 HTTP server，不需要 WebSocket。
+**关键决策**：不需要监听端口，不需要 HTTP server，不需要 WebSocket。ACP 协议本身就是 stdio。
 
 ## 3. 会话标识：从 cc-connect 学到的
 
@@ -104,23 +104,40 @@ cc-connect 用 `SessionKey` 作为全局唯一的会话路由键：
 - Feishu: `fmt.Sprintf("feishu:%s:%s", chatID, userID)` — `platform/feishu/feishu.go:2338`
 - 引擎路由: `e.interactiveStates[msg.SessionKey]` — `core/engine.go:862`
 
-### terminal-connect 的会话映射
+### acp-pty 的会话映射
 
-直接复用 SessionKey，不做二次加工：
+cc-connect 的 SessionKey（`{platform}:{chatID}:{userID}`）在 ACP 层不直接暴露给后端。acp-pty 通过 ACP 的 **sessionId** 管理会话：
 
 ```rust
-type SessionKey = String;  // 直接用 cc-connect 传来的值
+type SessionId = String;  // acp-pty 自己生成，返回给 cc-connect
 
 struct SessionRouter {
-    sessions: DashMap<SessionKey, LocalTerminalSession>,
+    sessions: DashMap<SessionId, LocalTerminalSession>,
 }
 ```
 
-**映射规则**：
-- 一个 SessionKey → 一个 PTY → 一个 shell 进程
-- SessionKey 由 cc-connect 生成并传入，terminal-connect 视为不透明字符串
-- `@term start` 创建映射，`@term stop` 销毁映射
-- 普通消息查找映射，不存在则提示用户先 `@term start`
+**两层 session 的关系**：
+
+```
+cc-connect 侧                          acp-pty 侧
+─────────────                           ──────────────────
+SessionKey                              
+"feishu:oc_abc:ou_melo"                 
+  ↓ engine 路由                         
+ACP session/new(cwd)    ──stdin──→      生成 sessionId = "term-{uuid}"
+                        ←─stdout──      返回 {sessionId: "term-{uuid}"}
+  ↓ 缓存 sessionId                     sessions["term-{uuid}"] = PTY
+ACP session/prompt(     ──stdin──→      查找 sessions["term-{uuid}"]
+  sessionId, prompt)                    写入 PTY stdin
+                        ←─stdout──      session/update 通知（PTY 输出）
+```
+
+**生命周期规则**：
+- `session/new` → 创建 PTY，返回 sessionId
+- `session/prompt` → 查找 sessionId 对应的 PTY，写入用户输入
+- `session/load` → V1 始终返回错误（PTY 不可跨进程恢复），cc-connect 会 fallback 到 `session/new`
+- 用户发 `@term stop` → 作为普通 prompt 进入，acp-pty 内部解析后销毁 PTY
+- cc-connect 重启 → 子进程被杀，所有 PTY 随之销毁；cc-connect 重新 spawn acp-pty 并调 `session/new`
 
 ## 4. 输出回传：从 cc-connect 学到的
 
@@ -151,7 +168,7 @@ StreamPreview 层
 - 分片: `core/engine.go:10906-10936`, `splitMessage()` 在 4000 rune 处切
 - 降级: `core/streaming.go:192-214`
 
-### terminal-connect 的输出缓冲（本项目实现）
+### acp-pty 的输出缓冲（本项目实现）
 
 PTY 输出与 AI 输出有本质区别：PTY 是**连续字节流**（每个字符都可能触发一次 read），AI 是**离散事件流**（EventText 粒度已经是词/句级别）。所以缓冲策略需要不同：
 
@@ -176,10 +193,10 @@ truncate_if_needed()  // 超长输出截断，保留头尾
 ```
 
 **与 cc-connect 的分工**：
-- terminal-connect 负责：字节流聚合、ANSI 清除、语义截断
+- acp-pty 负责：字节流聚合、ANSI 清除、语义截断
 - cc-connect 负责：消息分片（4000 rune）、流式预览编辑、平台 API 调用
 
-**为什么不在 terminal-connect 做消息分片**：cc-connect 已经做了，而且它知道各平台的具体限制。terminal-connect 只需要输出合理大小的文本块（≤ 8KB），cc-connect 会处理剩下的。
+**为什么不在 acp-pty 做消息分片**：cc-connect 已经做了，而且它知道各平台的具体限制。acp-pty 只需要输出合理大小的文本块（≤ 8KB），cc-connect 会处理剩下的。
 
 ## 5. 权限模型：从 cc-connect 学到的
 
@@ -206,65 +223,88 @@ truncate_if_needed()  // 超长输出截断，保留头尾
 - `admin_from` 是**项目全局**的，不区分群组
 - 两层独立，第一层过滤噪音，第二层保护敏感操作
 
-### terminal-connect 的权限模型（本项目实现）
+### acp-pty 的权限模型（本项目实现）
 
-terminal-connect 的安全边界比 cc-connect 更严格——因为这里控制的是**真实 shell**，不是 AI 对话。
+#### 权限分工：cc-connect 管人，acp-pty 管路由
+
+cc-connect 已经有两道权限门：
+1. `allow_from` — 平台层，过滤非白名单用户（静默丢弃）
+2. `admin_from` — 项目层，过滤非管理员（回复错误）
+
+能到达 acp-pty stdin 的消息，**用户身份已经被 cc-connect 校验过了**。acp-pty 不需要重复做 user 白名单。
+
+acp-pty 只需要做一件事：**chat → target 绑定**（决定这个会话用哪个 cwd 和 shell）。
 
 ```
-消息从 cc-connect stdin 进入
+消息经过 cc-connect allow_from + admin_from 校验后
   ↓
-第一层：admin 白名单（必须通过）
-  ├── 检查 user_id ∈ config.admins.users
-  ├── 不通过 → 静默丢弃（不告诉攻击者此服务存在）
-  └── 无 "*" 通配符（shell 访问不能开放给所有人）
+session/new(cwd) 到达 acp-pty
   ↓
-第二层：chat 白名单（必须通过）
-  ├── 检查 session_key 中的 chat_id 部分
-  ├── 匹配 config.targets.*.allowed_chats
-  ├── 不通过 → 静默丢弃
-  └── 同时决定该会话绑定到哪个 target（cwd, shell）
+chat → target 绑定
+  ├── session/new 的 cwd 参数来自 cc-connect 配置
+  ├── acp-pty 校验 cwd 是否在允许列表中
+  ├── 匹配 config.targets.*.cwd → 决定 shell 类型
+  ├── 不匹配 → 返回 JSON-RPC error
+  └── 匹配 → 创建 PTY
   ↓
-放行 → 路由到 SessionRouter
+放行 → 创建 PTY 会话
 ```
 
 ```toml
-# config.toml
-
-[admins]
-users = ["ou_melo_openid", "telegram_12345"]   # 跨平台 user_id
+# acp-pty config.toml
 
 [targets.dev]
 cwd = "/Users/melo/project"
 shell = "zsh"
-allowed_chats = ["feishu:oc_group1", "telegram:-100123"]
 
 [targets.ops]
 cwd = "/opt/services"
 shell = "bash"
-allowed_chats = ["feishu:oc_ops_group"]
 ```
 
-**与 cc-connect 的关键区别**：
+#### cc-connect 侧配置
 
-| 维度 | cc-connect | terminal-connect |
-|---|---|---|
-| 第一层粒度 | 平台级（allow_from 不区分群） | 保留，但依赖 cc-connect 执行 |
-| 第二层粒度 | 项目级（admin_from 不区分群） | **chat 级**（allowed_chats 按群控制） |
-| 通配符 | 支持 `"*"` | **禁止**（shell 不能开放） |
-| 失败响应 | allow_from 静默 / admin_from 报错 | **全部静默**（不暴露服务存在） |
-| 绑定关系 | 无 | chat → target（决定 cwd 和 shell） |
+```toml
+# cc-connect config.toml
+
+[[projects]]
+name = "terminal"
+admin_from = "ou_melo_openid,telegram_12345"  # 谁能用
+
+[projects.agent]
+type = "acp"
+
+[projects.agent.options]
+command = "/usr/local/bin/acp-pty"
+args = ["--config", "/etc/acp-pty.toml"]
+work_dir = "/Users/melo/project"  # 传给 session/new 的 cwd
+```
+
+#### 权限分层总结
+
+| 层 | 谁负责 | 做什么 | 失败行为 |
+|---|---|---|---|
+| allow_from | cc-connect | 过滤非白名单用户 | 静默丢弃 |
+| admin_from | cc-connect | 过滤非管理员 | 回复 "Admin privilege required" |
+| target 绑定 | acp-pty | cwd → shell 映射 | JSON-RPC error |
+
+**设计理由**：不在 acp-pty 重复做 user 白名单，避免 4 层权限检查的维护负担。cc-connect 的 `admin_from` 已经足够严格——配置时不用 `"*"` 通配符即可。安全边界在 cc-connect 层就闭合了。
 
 ## 6. 核心模块设计
 
 ```
-terminal-connect/
+acp-pty/
 ├── src/
-│   ├── main.rs              # 入口：stdin 读循环 + 信号处理
-│   ├── protocol.rs          # cc-connect stdio JSON 协议
-│   │   ├── IncomingMessage   # stdin 解析
-│   │   └── OutgoingMessage   # stdout 序列化
-│   ├── router.rs            # 消息路由
-│   │   ├── SessionRouter     # DashMap<SessionKey, Session>
+│   ├── main.rs              # 入口：stdin JSON-RPC 读循环 + 信号处理
+│   ├── acp.rs               # ACP 协议层（JSON-RPC 2.0）
+│   │   ├── RpcMessage        # 请求/响应/通知的统一类型
+│   │   ├── handle_initialize # 握手 + 能力声明
+│   │   ├── handle_session_new    # 创建 PTY
+│   │   ├── handle_session_prompt # 用户输入写 PTY
+│   │   ├── handle_session_load   # V1: 始终返回错误
+│   │   └── send_notification     # session/update 通知
+│   ├── router.rs            # 会话路由
+│   │   ├── SessionRouter     # DashMap<SessionId, Session>
 │   │   └── CommandParser     # @term start/stop/ctrl-c/sessions
 │   ├── session.rs           # PTY 会话管理
 │   │   ├── LocalTerminalSession
@@ -273,12 +313,10 @@ terminal-connect/
 │   ├── buffer.rs            # 输出缓冲
 │   │   ├── OutputBuffer      # 字节聚合 + 定时 flush
 │   │   └── strip_ansi()      # ANSI 转义清除
-│   ├── auth.rs              # 权限校验
-│   │   ├── AdminCheck        # user_id 白名单
-│   │   └── ChatCheck         # chat_id → target 映射
+│   ├── target.rs            # target 绑定
+│   │   └── resolve_target()  # cwd → TargetConfig 映射
 │   └── config.rs            # TOML 配置加载
 │       ├── Config
-│       ├── AdminConfig
 │       └── TargetConfig
 ├── config.example.toml
 ├── Cargo.toml
@@ -287,87 +325,110 @@ terminal-connect/
 
 ## 7. 数据流详解
 
-### 7.1 完整请求生命周期
+### 7.1 首次连接：initialize + session/new
+
+```
+cc-connect spawn acp-pty 子进程
+  ↓
+cc-connect stdin →
+  {"jsonrpc":"2.0","id":1,"method":"initialize",
+   "params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{}}}
+
+acp-pty stdout →
+  {"jsonrpc":"2.0","id":1,"result":{
+    "protocolVersion":1,
+    "agentCapabilities":{"loadSession":false,"sessionCapabilities":{}}
+  }}
+  ↓
+cc-connect stdin →
+  {"jsonrpc":"2.0","id":2,"method":"session/new",
+   "params":{"cwd":"/Users/melo/project","mcpServers":[]}}
+
+acp-pty 内部：
+  ↓ target.rs: resolve_target("/Users/melo/project") → target=dev, shell=zsh
+  ↓ session.rs: spawn_pty(zsh, cwd="/Users/melo/project")
+  ↓ sessions.insert("term-a1b2c3", LocalTerminalSession {...})
+  ↓ tokio::spawn(output_read_loop("term-a1b2c3"))
+
+acp-pty stdout →
+  {"jsonrpc":"2.0","id":2,"result":{"sessionId":"term-a1b2c3"}}
+```
+
+### 7.2 用户输入：session/prompt
 
 ```
 用户在飞书群输入 "ls -la"
   ↓
 飞书服务器 → cc-connect (WebSocket)
-  ↓ 平台 adapter 提取：
-  ↓   chatID = "oc_abc123"
-  ↓   userID = "ou_melo"
-  ↓   content = "ls -la"
-  ↓   sessionKey = "feishu:oc_abc123:ou_melo"
+  ↓ 平台 adapter: allow_from ✓, admin_from ✓
   ↓
-cc-connect engine.handleMessage()
-  ↓ allow_from 检查 ✓
-  ↓ 写入后端 stdin:
-  ↓   {"session_key":"feishu:oc_abc123:ou_melo","user_id":"ou_melo","content":"ls -la",...}
+cc-connect stdin →
+  {"jsonrpc":"2.0","id":3,"method":"session/prompt",
+   "params":{"sessionId":"term-a1b2c3",
+             "prompt":[{"type":"text","text":"ls -la"}]}}
   ↓
-terminal-connect stdin 读取
-  ↓ protocol.rs: 解析 IncomingMessage
-  ↓ auth.rs: admin 白名单 ✓, chat 白名单 ✓ → target=dev
-  ↓ router.rs: 查找 sessions["feishu:oc_abc123:ou_melo"]
+acp-pty 内部：
+  ↓ acp.rs: 解析 session/prompt
+  ↓ router.rs: 查找 sessions["term-a1b2c3"]
+  ↓ CommandParser: "ls -la" 不是 @term 命令 → 普通输入
   ↓ session.rs: write_to_pty("ls -la\n")
   ↓
-PTY 执行 ls -la
-  ↓ stdout 输出字节流
+PTY 执行 ls -la → stdout 输出字节流
   ↓
-buffer.rs: OutputBuffer 聚合
-  ↓ 300ms 无新输出 → flush
+buffer.rs: OutputBuffer 聚合（300ms 静默 / 4KB 上限）
   ↓ strip_ansi() 清除控制码
   ↓
-terminal-connect stdout 写出:
-  {"session_key":"feishu:oc_abc123:ou_melo","content":"total 128\ndrwxr-xr-x ..."}
+acp-pty stdout → session/update 通知：
+  {"jsonrpc":"2.0","method":"session/update",
+   "params":{"sessionId":"term-a1b2c3","update":{
+     "sessionUpdate":"agent_message_chunk",
+     "content":{"type":"text","text":"total 128\ndrwxr-xr-x  12 melo ..."}
+   }}}
   ↓
-cc-connect 读取后端 stdout
-  ↓ StreamPreview / UpdateMessage 实时编辑消息
+PTY 输出结束，返回 prompt RPC 响应：
+  {"jsonrpc":"2.0","id":3,"result":{}}
+  ↓
+cc-connect 读取 session/update
+  ↓ StreamPreview / UpdateMessage 实时编辑 IM 消息
   ↓ 超长则 splitMessage() 分片
   ↓
 飞书 API → 用户看到结果
 ```
 
-### 7.2 @term 命令处理流
+### 7.3 @term 命令处理
+
+@term 命令作为普通 `session/prompt` 进入，由 acp-pty 内部解析：
 
 ```
-"@term start"
+用户: "@term ctrl-c"
   ↓
-CommandParser::parse("@term start") → Command::Start
+session/prompt(sessionId, prompt=[{type:"text", text:"@term ctrl-c"}])
   ↓
-SessionRouter::handle_start(session_key, target)
+CommandParser::parse("@term ctrl-c") → Command::CtrlC
   ↓
-session.rs::spawn_pty(SpawnConfig {
-    shell: target.shell,       // "zsh"
-    cwd: target.cwd,           // "/Users/melo/project"
-    env: filtered_env(),       // 最小化环境变量
-})
+session.rs: send_signal(SIGINT) 到 PTY child
   ↓
-portable_pty::CommandBuilder::new(shell)
-    .cwd(cwd)
-    .env(...)
+session/update 通知: "SIGINT sent"
   ↓
-sessions.insert(session_key, LocalTerminalSession {
-    session_key,
-    owner_user_id: user_id,
-    target_name: "dev",
-    pty_pair: pair,            // master + slave
-    child: child_process,
-    reader: BufReader(master.try_clone_reader()),
-    writer: master.take_writer(),
-    buffer: OutputBuffer::new(),
-    created_at: Instant::now(),
-})
-  ↓
-tokio::spawn(output_read_loop(session_key))  // 后台读 PTY 输出
-  ↓
-回复: "shell started (zsh) | session: feishu:oc_abc123:ou_melo | cwd: /Users/melo/project"
+session/prompt RPC 返回: {}
 ```
 
-### 7.3 输出读取后台循环
+```
+用户: "@term stop"
+  ↓
+session/prompt → CommandParser → Command::Stop
+  ↓
+session.rs: kill PTY child, drop session
+  ↓
+session/update 通知: "shell terminated"
+  ↓
+session/prompt RPC 返回: {}
+```
+
+### 7.4 输出读取后台循环
 
 ```rust
-// 每个 session 一个 tokio task
-async fn output_read_loop(key: SessionKey, reader: PtyReader, buffer: OutputBuffer) {
+async fn output_read_loop(session_id: SessionId, reader: PtyReader, buffer: OutputBuffer) {
     let mut buf = [0u8; 1024];
     loop {
         select! {
@@ -382,59 +443,128 @@ async fn output_read_loop(key: SessionKey, reader: PtyReader, buffer: OutputBuff
                 // 300ms 静默超时 或 4KB 上限触发
                 let text = strip_ansi(&chunk);
                 let text = truncate_if_needed(&text, 8192);
-                send_stdout(OutgoingMessage {
-                    session_key: key.clone(),
-                    content: text,
-                });
+                // 发送 ACP session/update 通知
+                send_notification("session/update", json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": text}
+                    }
+                }));
             }
         }
     }
-    // shell 退出，清理 session
-    sessions.remove(&key);
-    send_stdout(OutgoingMessage {
-        session_key: key,
-        content: "shell exited".into(),
-    });
+    // shell 退出，发送最后一条通知
+    sessions.remove(&session_id);
+    send_notification("session/update", json!({
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "shell exited"}
+        }
+    }));
 }
 ```
 
-## 8. 协议定义
+## 8. ACP 协议实现
 
-### 8.1 stdin（cc-connect → terminal-connect）
+acp-pty 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **newline-delimited JSON-RPC 2.0 over stdio**。
+
+### 8.1 acp-pty 需要处理的 RPC 方法
+
+| 方向 | 方法 | 必须实现 | 说明 |
+|---|---|---|---|
+| cc→term | `initialize` | ✅ | 握手，声明能力 |
+| cc→term | `session/new` | ✅ | 创建 PTY 会话 |
+| cc→term | `session/prompt` | ✅ | 用户输入写入 PTY |
+| cc→term | `session/load` | ✅ | 始终返回 error（PTY 不可恢复） |
+| cc→term | `session/list` | 可选 | 列出活跃 PTY 会话 |
+| cc→term | `session/set_mode` | 忽略 | 返回空 `{}` |
+| term→cc | `session/update` | ✅ | PTY 输出通知（notification，无 id） |
+
+### 8.2 请求/响应示例
+
+**initialize**
 
 ```json
-{
-    "session_key": "feishu:oc_abc123:ou_melo",
-    "platform": "feishu",
-    "user_id": "ou_melo",
-    "user_name": "melo",
-    "chat_name": "dev-group",
-    "content": "ls -la",
-    "message_id": "msg_xxx"
-}
+// → stdin
+{"jsonrpc":"2.0","id":1,"method":"initialize",
+ "params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"cc-connect"}}}
+
+// ← stdout
+{"jsonrpc":"2.0","id":1,"result":{
+  "protocolVersion":1,
+  "agentCapabilities":{
+    "loadSession":false,
+    "sessionCapabilities":{}
+  }
+}}
 ```
 
-每条消息一行 JSON（newline-delimited JSON, NDJSON）。
+`loadSession: false` 告诉 cc-connect 不要尝试 `session/load`。
 
-### 8.2 stdout（terminal-connect → cc-connect）
+**session/new**
 
 ```json
-{
-    "session_key": "feishu:oc_abc123:ou_melo",
-    "type": "text",
-    "content": "total 128\ndrwxr-xr-x  12 melo staff  384 Jun  1 10:00 .\n..."
-}
+// → stdin
+{"jsonrpc":"2.0","id":2,"method":"session/new",
+ "params":{"cwd":"/Users/melo/project","mcpServers":[]}}
+
+// ← stdout
+{"jsonrpc":"2.0","id":2,"result":{
+  "sessionId":"term-a1b2c3d4"
+}}
 ```
 
-| type | 含义 |
-|---|---|
-| `text` | PTY 输出文本 |
-| `system` | 系统消息（session started/stopped/exited） |
-| `error` | 错误信息 |
+**session/prompt**
 
-### 8.3 stderr（日志）
+```json
+// → stdin
+{"jsonrpc":"2.0","id":3,"method":"session/prompt",
+ "params":{"sessionId":"term-a1b2c3d4",
+           "prompt":[{"type":"text","text":"ls -la"}]}}
 
-terminal-connect 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect 可选择捕获或丢弃。
+// ← stdout (notification, 异步，可多条)
+{"jsonrpc":"2.0","method":"session/update",
+ "params":{"sessionId":"term-a1b2c3d4","update":{
+   "sessionUpdate":"agent_message_chunk",
+   "content":{"type":"text","text":"total 128\ndrwxr-xr-x ..."}
+ }}}
+
+// ← stdout (RPC 响应，表示本轮处理结束)
+{"jsonrpc":"2.0","id":3,"result":{}}
+```
+
+**关键**：`session/prompt` 的 RPC 响应在 PTY 输出结束后才返回。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。
+
+**session/load（始终失败）**
+
+```json
+// → stdin
+{"jsonrpc":"2.0","id":4,"method":"session/load",
+ "params":{"sessionId":"term-a1b2c3d4","cwd":"/Users/melo/project","mcpServers":[]}}
+
+// ← stdout
+{"jsonrpc":"2.0","id":4,"error":{
+  "code":-32600,"message":"PTY sessions cannot be restored"
+}}
+```
+
+cc-connect 收到错误后会 fallback 到 `session/new`。
+
+### 8.3 session/update 的 update 类型
+
+acp-pty 只使用一种 update 类型：
+
+| sessionUpdate | 用途 | 映射到 cc-connect 事件 |
+|---|---|---|
+| `agent_message_chunk` | PTY 输出文本 | `EventText` → 流式编辑 IM 消息 |
+
+不需要实现 `tool_call`、`tool_call_update`、`plan` 等——acp-pty 没有工具调用概念。
+
+### 8.4 stderr（日志）
+
+acp-pty 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect 可选择捕获或丢弃。
 
 ## 9. 安全设计
 
@@ -443,8 +573,8 @@ terminal-connect 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-
 | 威胁 | 缓解 |
 |---|---|
 | 未授权用户执行命令 | 双层白名单（admin + chat），全部静默丢弃 |
-| PTY 逃逸 | portable-pty 在独立进程中运行，不共享 terminal-connect 的 fd |
-| 环境变量泄露 | spawn_pty 使用最小化 env，不继承 terminal-connect 的全部环境 |
+| PTY 逃逸 | portable-pty 在独立进程中运行，不共享 acp-pty 的 fd |
+| 环境变量泄露 | spawn_pty 使用最小化 env，不继承 acp-pty 的全部环境 |
 | 输出注入 IM | strip_ansi 清除控制码，防止在 IM 端渲染异常内容 |
 | 资源耗尽 | 最大并发 session 数限制（默认 16），单 session 输出速率限制 |
 | Shell 进程僵尸 | child process reaper：定期检查 + session 空闲超时自动 kill |
@@ -474,17 +604,19 @@ max_output_buffer = 65536   # 单次输出缓冲上限 64KB
 
 ## 10. 从 cc-connect 借鉴 vs 自己实现 — 总结
 
-| 能力 | cc-connect 负责 | terminal-connect 负责 |
+| 能力 | cc-connect 负责 | acp-pty 负责 |
 |---|---|---|
 | IM 协议适配 | ✅ 7+ 平台 adapter | - |
-| SessionKey 生成 | ✅ `{platform}:{chatID}:{userID}` | 直接使用 |
-| 消息归一化 | ✅ `core.Message` | 解析 stdin JSON |
+| SessionKey 路由 | ✅ `{platform}:{chatID}:{userID}` | 不可见，cc-connect 内部 |
+| ACP 会话管理 | ✅ 发起 initialize/session/new/prompt | ✅ 响应 RPC，管理 sessionId |
+| 消息归一化 | ✅ `core.Message` → ACP prompt | ✅ 解析 JSON-RPC 2.0 |
 | allow_from 过滤 | ✅ 平台层静默丢弃 | - |
-| admin 白名单 | - | ✅ user_id 检查 |
-| chat 白名单 | - | ✅ chat_id → target 映射 |
-| 流式消息编辑 | ✅ PreviewStarter/UpdateMessage | - |
+| admin 白名单 | ✅ admin_from 项目层校验 | -（不重复做） |
+| target 绑定 | - | ✅ cwd → shell 映射 |
+| 流式消息编辑 | ✅ 读取 session/update → PreviewStarter | ✅ 发送 session/update notification |
 | 消息分片 | ✅ 4000 rune 切割 | - |
 | 输出缓冲 | - | ✅ 300ms/4KB 聚合 |
 | ANSI 清除 | - | ✅ strip_ansi_escapes |
 | PTY 管理 | - | ✅ portable-pty |
 | 会话生命周期 | - | ✅ start/stop/timeout/reap |
+| 会话恢复 | ✅ 尝试 session/load | ✅ 返回 error，触发 session/new |

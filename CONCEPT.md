@@ -176,7 +176,7 @@ bot   : total 128
         ...
 
 melo  : cargo build 2>&1
-bot   : Compiling terminal-connect v0.1.0
+bot   : Compiling acp-pty v0.1.0
         Finished dev [unoptimized + debuginfo] target(s) in 12.34s
 
 melo  : @term ctrl-c
