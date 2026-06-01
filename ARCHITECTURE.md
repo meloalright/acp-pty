@@ -260,14 +260,14 @@ cc-connect 已经有两道权限门：
 
 能到达 acp-pty stdin 的消息，**用户身份已经被 cc-connect 校验过了**。acp-pty 不需要重复做 user 白名单。
 
-acp-pty 只需要做一件事：**chat → target 绑定**（决定这个会话用哪个 cwd 和 shell）。
+acp-pty 只需要做一件事：**cwd → target 绑定**（决定这个会话用哪个 shell）。
 
 ```
 消息经过 cc-connect allow_from + admin_from 校验后
   ↓
 session/new(cwd) 到达 acp-pty
   ↓
-chat → target 绑定
+cwd → target 绑定
   ├── session/new 的 cwd 参数来自 cc-connect 配置
   ├── acp-pty 校验 cwd 是否在允许列表中
   ├── 匹配 config.targets.*.cwd → 决定 shell 类型
@@ -339,15 +339,15 @@ acp-pty/
 │   │   └── write_to_pty()    # 用户输入写入 stdin
 │   ├── buffer.rs            # 输出缓冲
 │   │   ├── OutputBuffer      # 字节聚合 + 定时 flush
-│   │   └── strip_ansi()      # ANSI 转义清除
+│   │   ├── strip_ansi()      # ANSI 转义清除
+│   │   └── PromptTracker     # 300ms 静默 / 30s 硬上限，控制 RPC 返回时机
 │   ├── target.rs            # target 绑定
 │   │   └── resolve_target()  # cwd → TargetConfig 映射
 │   └── config.rs            # TOML 配置加载
 │       ├── Config
 │       └── TargetConfig
 ├── config.example.toml
-├── Cargo.toml
-└── CONCEPT.md
+└── Cargo.toml
 ```
 
 ## 7. 数据流详解
@@ -527,7 +527,7 @@ acp-pty 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **ne
 | cc→term | `initialize` | ✅ | 握手，声明能力 |
 | cc→term | `session/new` | ✅ | 创建 PTY 会话 |
 | cc→term | `session/prompt` | ✅ | 用户输入写入 PTY |
-| cc→term | `session/load` | ✅ | 始终返回 error（PTY 不可恢复） |
+| cc→term | `session/load` | 防御性 | 始终返回 error（`loadSession:false` 已告知 cc-connect 不调用，此为兜底） |
 | cc→term | `session/list` | ✅ | 列出活跃 PTY 会话（替代 @term sessions 命令） |
 | cc→term | `session/set_mode` | 忽略 | 返回空 `{}` |
 | term→cc | `session/update` | ✅ | PTY 输出通知（notification，无 id） |
@@ -601,6 +601,40 @@ acp-pty 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **ne
 ```
 
 cc-connect 收到错误后会 fallback 到 `session/new`。
+
+**session/list**
+
+```json
+// → stdin
+{"jsonrpc":"2.0","id":5,"method":"session/list","params":{}}
+
+// ← stdout
+{"jsonrpc":"2.0","id":5,"result":{
+  "sessions":[
+    {"sessionId":"term-a1b2c3d4","cwd":"/Users/melo/project","title":"zsh"}
+  ]
+}}
+```
+
+返回所有活跃 PTY 会话。`title` 字段为 shell 类型。session 被 `@term stop` 销毁后不再出现在列表中。
+
+**session/prompt 对已销毁 session 的处理**
+
+用户 `@term stop` 后 acp-pty 销毁 PTY 并移除 session。但 cc-connect 仍缓存着旧 sessionId，后续用户消息会以该 sessionId 发来 `session/prompt`：
+
+```json
+// → stdin（session 已不存在）
+{"jsonrpc":"2.0","id":6,"method":"session/prompt",
+ "params":{"sessionId":"term-a1b2c3d4",
+           "prompt":[{"type":"text","text":"ls"}]}}
+
+// ← stdout
+{"jsonrpc":"2.0","id":6,"error":{
+  "code":-32600,"message":"session not found: term-a1b2c3d4"
+}}
+```
+
+cc-connect 收到错误后会调 `session/new` 重新创建会话。用户无需手动操作。
 
 ### 8.3 session/update 的 update 类型
 
