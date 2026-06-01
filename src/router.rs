@@ -103,10 +103,7 @@ impl SessionRouter {
                     state.session.prompt_tracker.clone()
                 };
                 prompt_tracker
-                    .wait_for_settle(
-                        Duration::from_millis(300),
-                        Duration::from_secs(30),
-                    )
+                    .wait_for_settle(Duration::from_secs(120))
                     .await;
                 Ok(())
             }
@@ -135,6 +132,7 @@ impl SessionRouter {
 }
 
 fn send_update(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
+    let wrapped = format!("```\n{}\n```", text.trim_end());
     let msg = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -142,11 +140,39 @@ fn send_update(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
             "sessionId": session_id,
             "update": {
                 "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": text}
+                "content": {"type": "text", "text": wrapped}
             }
         }
     });
     stdout_tx.send(msg.to_string()).ok();
+}
+
+fn flush_and_notify(
+    buffer: &mut Vec<u8>,
+    prompt_tracker: &PromptTracker,
+    stdout_tx: &StdoutTx,
+    session_id: &str,
+    max_output_buffer: usize,
+    is_first: &mut bool,
+) {
+    let chunk = buffer.drain(..).collect::<Vec<_>>();
+    let text = strip_ansi(&chunk);
+    let text = truncate_if_needed(&text, max_output_buffer);
+
+    if *is_first {
+        prompt_tracker.set_shell_prompt(&text);
+        *is_first = false;
+        send_update(stdout_tx, session_id, &text);
+        return;
+    }
+
+    send_update(stdout_tx, session_id, &text);
+
+    if prompt_tracker.output_ends_with_prompt(&text) {
+        prompt_tracker.force_complete();
+    } else {
+        prompt_tracker.notify_output();
+    }
 }
 
 async fn output_read_loop(
@@ -158,8 +184,9 @@ async fn output_read_loop(
     max_output_buffer: usize,
 ) {
     let mut buffer: Vec<u8> = Vec::new();
-    let flush_interval = Duration::from_millis(300);
+    let flush_interval = Duration::from_millis(100);
     let max_chunk = 4096usize;
+    let mut is_first = true;
 
     loop {
         tokio::select! {
@@ -168,31 +195,19 @@ async fn output_read_loop(
                     Some(data) => {
                         buffer.extend_from_slice(&data);
                         if buffer.len() >= max_chunk {
-                            let chunk = buffer.drain(..).collect::<Vec<_>>();
-                            let text = strip_ansi(&chunk);
-                            let text = truncate_if_needed(&text, max_output_buffer);
-                            send_update(&stdout_tx, &session_id, &text);
-                            prompt_tracker.notify_output();
+                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut is_first);
                         }
                     }
                     None => {
-                        // PTY reader closed
                         if !buffer.is_empty() {
-                            let text = strip_ansi(&buffer);
-                            let text = truncate_if_needed(&text, max_output_buffer);
-                            send_update(&stdout_tx, &session_id, &text);
-                            prompt_tracker.notify_output();
+                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut is_first);
                         }
                         break;
                     }
                 }
             }
             _ = tokio::time::sleep(flush_interval), if !buffer.is_empty() => {
-                let chunk = buffer.drain(..).collect::<Vec<_>>();
-                let text = strip_ansi(&chunk);
-                let text = truncate_if_needed(&text, max_output_buffer);
-                send_update(&stdout_tx, &session_id, &text);
-                prompt_tracker.notify_output();
+                flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut is_first);
             }
         }
     }

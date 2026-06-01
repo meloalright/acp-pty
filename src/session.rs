@@ -30,15 +30,16 @@ impl LocalTerminalSession {
         })?;
 
         let mut cmd = CommandBuilder::new(&target.shell);
-        if target.shell.ends_with("bash") {
-            cmd.args(["--noprofile", "--norc"]);
-        }
+        cmd.args(["-l"]);
         cmd.cwd(&target.cwd);
 
-        cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+        for (key, val) in std::env::vars() {
+            cmd.env(key, val);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        cmd.env("HOME", &home);
         cmd.env("TERM", "xterm-256color");
         cmd.env("LANG", "en_US.UTF-8");
-        cmd.env("HOME", target.cwd.to_string_lossy().to_string());
 
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);

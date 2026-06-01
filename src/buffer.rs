@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -23,6 +23,7 @@ pub struct PromptTracker {
     notify: Arc<Notify>,
     active: Arc<AtomicBool>,
     completed: Arc<Notify>,
+    shell_prompt: Arc<Mutex<Option<String>>>,
 }
 
 impl PromptTracker {
@@ -31,6 +32,22 @@ impl PromptTracker {
             notify: Arc::new(Notify::new()),
             active: Arc::new(AtomicBool::new(false)),
             completed: Arc::new(Notify::new()),
+            shell_prompt: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set_shell_prompt(&self, prompt: &str) {
+        let trimmed = prompt.trim().to_string();
+        if !trimmed.is_empty() {
+            *self.shell_prompt.lock().unwrap() = Some(trimmed);
+        }
+    }
+
+    pub fn output_ends_with_prompt(&self, text: &str) -> bool {
+        if let Some(prompt) = &*self.shell_prompt.lock().unwrap() {
+            text.trim_end().ends_with(prompt.as_str())
+        } else {
+            false
         }
     }
 
@@ -40,29 +57,12 @@ impl PromptTracker {
         }
     }
 
-    pub async fn wait_for_settle(&self, silence: Duration, hard_limit: Duration) {
+    pub async fn wait_for_settle(&self, hard_limit: Duration) {
         self.active.store(true, Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now() + hard_limit;
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            let timeout = silence.min(remaining);
-
-            tokio::select! {
-                _ = tokio::time::sleep(timeout) => {
-                    break;
-                }
-                _ = self.notify.notified() => {
-                    continue;
-                }
-                _ = self.completed.notified() => {
-                    break;
-                }
-            }
+        tokio::select! {
+            _ = self.completed.notified() => {}
+            _ = tokio::time::sleep(hard_limit) => {}
         }
 
         self.active.store(false, Ordering::Relaxed);
