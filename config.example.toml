@@ -10,5 +10,5 @@ shell = "bash"
 idle_timeout_secs = 1800
 max_sessions = 16
 max_output_buffer = 65536
-settle_idle_ms = 1500
+settle_idle_ms = 3000
 settle_hard_limit_secs = 120

@@ -71,7 +71,7 @@ fn default_max_output_buffer() -> usize {
     65536
 }
 fn default_settle_idle_ms() -> u64 {
-    1500
+    3000
 }
 fn default_settle_hard_limit_secs() -> u64 {
     120
