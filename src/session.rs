@@ -55,9 +55,13 @@ impl LocalTerminalSession {
         let mut cmd = CommandBuilder::new(&target.shell);
         let init = if shell_name.contains("zsh") {
             cmd.args(["-f", "-i"]);
+            // unsetopt PROMPT_SP/PROMPT_CR drops zsh's "%" partial-line marker
+            // and trailing redraw; with TERM=dumb (set below) ZLE is off, so
+            // there's no line-editor redraw noise to strip.
             format!(
                 "[ -f \"$HOME/.zshrc\" ] && source \"$HOME/.zshrc\" >/dev/null 2>&1; \
-                 precmd_functions=(); precmd() {{ :; }}; PS1='{m}'\n",
+                 precmd_functions=(); precmd() {{ :; }}; \
+                 unsetopt PROMPT_SP PROMPT_CR 2>/dev/null; PS1='{m}'\n",
                 m = marker
             )
         } else if shell_name.contains("bash") {
@@ -78,7 +82,10 @@ impl LocalTerminalSession {
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         cmd.env("HOME", &home);
-        cmd.env("TERM", "xterm-256color");
+        // TERM=dumb: output goes to IM (ANSI is stripped anyway), and a dumb
+        // terminal disables zsh's ZLE line editor, whose cursor-redraw escape
+        // sequences otherwise leak as garbled text (e.g. "lls", stray "%").
+        cmd.env("TERM", "dumb");
         cmd.env("LANG", "en_US.UTF-8");
 
         let prompt_tracker = PromptTracker::new();
