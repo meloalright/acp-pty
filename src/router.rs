@@ -30,9 +30,9 @@ pub enum Command {
 
 pub fn parse_command(text: &str) -> Option<Command> {
     let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("@term stop") {
+    if trimmed.eq_ignore_ascii_case("@shell stop") {
         Some(Command::Stop)
-    } else if trimmed.eq_ignore_ascii_case("@term ctrl-c") {
+    } else if trimmed.eq_ignore_ascii_case("@shell ctrl-c") {
         Some(Command::CtrlC)
     } else {
         None

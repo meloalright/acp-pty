@@ -133,10 +133,10 @@ ACP session/prompt(     ──stdin──→      查找 sessions["term-{uuid}"]
 ```
 
 **生命周期规则**：
-- `session/new` → **立即创建 PTY 并 spawn shell**，返回 sessionId。用户第一条消息直接写入 PTY，无需 `@term start`
+- `session/new` → **立即创建 PTY 并 spawn shell**，返回 sessionId。用户第一条消息直接写入 PTY，无需 `@shell start`
 - `session/prompt` → 查找 sessionId 对应的 PTY，写入用户输入
 - `session/load` → V1 始终返回错误（PTY 不可跨进程恢复），cc-connect 会 fallback 到 `session/new`
-- 用户发 `@term stop` → 作为普通 prompt 进入，shell-acp 内部解析后销毁 PTY 并清理 session
+- 用户发 `@shell stop` → 作为普通 prompt 进入，shell-acp 内部解析后销毁 PTY 并清理 session
 - cc-connect 重启 → 子进程被杀，所有 PTY 随之销毁；cc-connect 重新 spawn shell-acp 并调 `session/new`
 
 ## 4. 输出回传：从 cc-connect 学到的
@@ -183,7 +183,7 @@ OutputBuffer {
   ↓ 触发条件（任一）
   ├── 静默超时：最后一次 read 后 300ms 无新数据
   ├── 字节上限：buffer ≥ 4096 bytes
-  └── 显式 flush：收到 @term ctrl-c 等命令时
+  └── 显式 flush：收到 @shell ctrl-c 等命令时
   ↓
 strip_ansi_escapes()  // 清除颜色/光标控制码
   ↓
@@ -332,7 +332,7 @@ shell-acp/
 │   │   └── send_notification     # session/update 通知
 │   ├── router.rs            # 会话路由
 │   │   ├── SessionRouter     # DashMap<SessionId, Session>
-│   │   └── CommandParser     # @term stop/ctrl-c
+│   │   └── CommandParser     # @shell stop/ctrl-c
 │   ├── session.rs           # PTY 会话管理
 │   │   ├── LocalTerminalSession
 │   │   ├── spawn_pty()       # portable-pty 启动 shell
@@ -397,7 +397,7 @@ cc-connect stdin →
 shell-acp 内部：
   ↓ acp.rs: 解析 session/prompt
   ↓ router.rs: 查找 sessions["term-a1b2c3"]
-  ↓ CommandParser: "ls -la" 不是 @term 命令 → 普通输入
+  ↓ CommandParser: "ls -la" 不是 @shell 命令 → 普通输入
   ↓ session.rs: write_to_pty("ls -la\n")
   ↓
 PTY 执行 ls -la → stdout 输出字节流
@@ -426,16 +426,16 @@ cc-connect: EventResult(Done=true) → finalize IM 消息
 飞书 API → 用户看到最终结果
 ```
 
-### 7.3 @term 命令处理
+### 7.3 @shell 命令处理
 
-@term 命令作为普通 `session/prompt` 进入，由 shell-acp 内部解析：
+@shell 命令作为普通 `session/prompt` 进入，由 shell-acp 内部解析：
 
 ```
-用户: "@term ctrl-c"
+用户: "@shell ctrl-c"
   ↓
-session/prompt(sessionId, prompt=[{type:"text", text:"@term ctrl-c"}])
+session/prompt(sessionId, prompt=[{type:"text", text:"@shell ctrl-c"}])
   ↓
-CommandParser::parse("@term ctrl-c") → Command::CtrlC
+CommandParser::parse("@shell ctrl-c") → Command::CtrlC
   ↓
 session.rs: send_signal(SIGINT) 到 PTY child
   ↓
@@ -445,7 +445,7 @@ session/prompt RPC 返回: {}
 ```
 
 ```
-用户: "@term stop"
+用户: "@shell stop"
   ↓
 session/prompt → CommandParser → Command::Stop
   ↓
@@ -514,7 +514,7 @@ async fn handle_session_prompt(session_id, prompt_text) -> RpcResult {
 `PromptTracker` 的逻辑：
 - `notify_output()` — output_read_loop 每次 flush 后调用，重置 300ms 静默计时器
 - `wait_for_settle()` — 阻塞直到 300ms 无新 notify_output，或 30s 硬上限到达
-- `@term ctrl-c` / `@term stop` 命令直接完成 tracker，立即返回 RPC
+- `@shell ctrl-c` / `@shell stop` 命令直接完成 tracker，立即返回 RPC
 
 ## 8. ACP 协议实现
 
@@ -528,7 +528,7 @@ shell-acp 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **
 | cc→term | `session/new` | ✅ | 创建 PTY 会话 |
 | cc→term | `session/prompt` | ✅ | 用户输入写入 PTY |
 | cc→term | `session/load` | 防御性 | 始终返回 error（`loadSession:false` 已告知 cc-connect 不调用，此为兜底） |
-| cc→term | `session/list` | ✅ | 列出活跃 PTY 会话（替代 @term sessions 命令） |
+| cc→term | `session/list` | ✅ | 列出活跃 PTY 会话（替代 @shell sessions 命令） |
 | cc→term | `session/set_mode` | 忽略 | 返回空 `{}` |
 | term→cc | `session/update` | ✅ | PTY 输出通知（notification，无 id） |
 
@@ -616,11 +616,11 @@ cc-connect 收到错误后会 fallback 到 `session/new`。
 }}
 ```
 
-返回所有活跃 PTY 会话。`title` 字段为 shell 类型。session 被 `@term stop` 销毁后不再出现在列表中。
+返回所有活跃 PTY 会话。`title` 字段为 shell 类型。session 被 `@shell stop` 销毁后不再出现在列表中。
 
 **session/prompt 对已销毁 session 的处理**
 
-用户 `@term stop` 后 shell-acp 销毁 PTY 并移除 session。但 cc-connect 仍缓存着旧 sessionId，后续用户消息会以该 sessionId 发来 `session/prompt`：
+用户 `@shell stop` 后 shell-acp 销毁 PTY 并移除 session。但 cc-connect 仍缓存着旧 sessionId，后续用户消息会以该 sessionId 发来 `session/prompt`：
 
 ```json
 // → stdin（session 已不存在）
