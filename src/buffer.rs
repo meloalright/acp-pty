@@ -55,6 +55,9 @@ pub struct PromptTracker {
     last_trailing: Arc<Mutex<Option<String>>>,
     /// The sentinel string injected as PS1; redacted from displayed output.
     marker: Arc<Mutex<Option<String>>>,
+    /// The command written for the current turn, whose terminal echo should be
+    /// stripped from the start of the turn's output. Cleared after one strip.
+    pending_echo: Arc<Mutex<Option<String>>>,
     /// Set once the sentinel has first appeared (shell is up and integrated),
     /// or once the readiness watchdog gives up. Output before this is startup
     /// noise and is dropped.
@@ -72,6 +75,40 @@ impl PromptTracker {
             last_trailing: Arc::new(Mutex::new(None)),
             marker: Arc::new(Mutex::new(None)),
             ready: Arc::new(AtomicBool::new(false)),
+            pending_echo: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Remember the command just written, so its terminal echo can be stripped
+    /// from the start of this turn's output.
+    pub fn set_pending_echo(&self, cmd: &str) {
+        *self.pending_echo.lock().unwrap() = Some(cmd.to_string());
+    }
+
+    /// Strip a leading echoed-command line. Applied once per turn: if the first
+    /// line of `text` equals the command we wrote, drop it. Cleared on the
+    /// first attempt so a later matching line is never removed by accident.
+    pub fn strip_pending_echo(&self, text: &str) -> String {
+        let mut guard = self.pending_echo.lock().unwrap();
+        let cmd = match guard.as_ref() {
+            Some(c) => c.clone(),
+            None => return text.to_string(),
+        };
+        match text.find('\n') {
+            Some(nl) if text[..nl].trim_end_matches('\r') == cmd => {
+                *guard = None;
+                text[nl + 1..].to_string()
+            }
+            None if text.trim_end_matches('\r') == cmd => {
+                // Whole chunk is just the echo, newline not flushed yet.
+                *guard = None;
+                String::new()
+            }
+            _ => {
+                // First chunk isn't the echo — give up to avoid stripping later.
+                *guard = None;
+                text.to_string()
+            }
         }
     }
 

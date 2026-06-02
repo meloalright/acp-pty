@@ -682,7 +682,7 @@ shell-acp 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect
    - 其他:`<shell> -i`
 2. **自己补 source 用户 rc**,保留用户的 alias/PATH 等(向导已被上一步规避):
    - 如 `[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"`
-3. **注入唯一哨兵 PS1**(如 `__SHELLACP_<token>__`),作为确定性提示符判据;展示给用户时从输出里抹掉。zsh 还会清空 `precmd_functions`,bash 清空 `PROMPT_COMMAND`,防止主题动态改写提示符。
+3. **注入唯一哨兵 PS1**(如 `__SHELLACP_<token>__`),作为确定性提示符判据;展示给用户时从输出里抹掉。zsh 还会清空 `precmd_functions`,bash 清空 `PROMPT_COMMAND`,防止主题动态改写提示符。此外,每轮还会**剥离命令自身的终端回显行**(`set_pending_echo` / `strip_pending_echo`)——用户在 IM 里发的命令已经可见,PTY 回显的那一行属于冗余。
 4. **就绪门 + 看门狗**:哨兵首次出现前的输出(启动噪声/init 行)一律丢弃;**第一条命令在写入前会先等就绪**(`wait_until_ready`),否则 cc-connect 在 `session/new` 后立即发命令时,init 输出会和首条命令输出挤在一起被一起丢弃(表现为首条命令空输出 + 卡满静默窗口)。若 5s 内仍未见哨兵(集成失败或 shell 真卡在交互式提示),打 `warn` 日志并降级为直接展示原始输出,避免“静默无输出”。
 
 环境变量:当前**继承父进程全部 env**,然后覆盖 `HOME` / `TERM=xterm-256color` / `LANG=en_US.UTF-8`(`session.rs`)。

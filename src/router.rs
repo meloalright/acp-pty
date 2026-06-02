@@ -117,6 +117,9 @@ impl SessionRouter {
                         .sessions
                         .get(session_id)
                         .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
+                    // Remember the command so its terminal echo is stripped from
+                    // the output the user sees (they already typed it).
+                    prompt_tracker.set_pending_echo(text);
                     let input = format!("{}\n", text);
                     state.session.write_to_pty(&input)?;
                 }
@@ -192,8 +195,9 @@ fn flush_and_notify(
     }
 
     // Detection runs on the raw text (with the marker); the user sees it
-    // redacted.
+    // redacted and with the command's own echo stripped.
     let display = prompt_tracker.redact(&text);
+    let display = prompt_tracker.strip_pending_echo(&display);
     if !display.trim().is_empty() {
         send_update(stdout_tx, session_id, &display);
     }
