@@ -16,7 +16,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("acp_pty=info".parse().unwrap()),
+                .add_directive("shell_acp=info".parse().unwrap()),
         )
         .init();
 
@@ -49,7 +49,7 @@ async fn main() {
 
     let router = Arc::new(SessionRouter::new(config, stdout_tx.clone()));
 
-    tracing::info!("acp-pty started");
+    tracing::info!("shell-acp started");
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -80,5 +80,5 @@ async fn main() {
         }
     }
 
-    tracing::info!("acp-pty shutting down");
+    tracing::info!("shell-acp shutting down");
 }

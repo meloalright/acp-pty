@@ -1,5 +1,5 @@
 [package]
-name = "acp-pty"
+name = "shell-acp"
 version = "0.1.0"
 edition = "2021"
 
