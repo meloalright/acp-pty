@@ -1,7 +1,8 @@
-use crate::buffer::{strip_ansi, truncate_if_needed, PromptTracker};
+use crate::buffer::{truncate_if_needed, PromptTracker};
 use crate::config::Config;
 use crate::session::LocalTerminalSession;
 use crate::target::resolve_target_or_default;
+use crate::term::TermRenderer;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use serde_json::json;
@@ -173,47 +174,56 @@ fn send_update(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
     stdout_tx.send(msg.to_string()).ok();
 }
 
-fn flush_and_notify(
-    buffer: &mut Vec<u8>,
+/// Render newly-finalized terminal rows, emit them to the user, and run
+/// prompt/settle detection against the active (cursor) line.
+fn emit_step(
+    renderer: &mut TermRenderer,
     prompt_tracker: &PromptTracker,
     stdout_tx: &StdoutTx,
     session_id: &str,
     max_output_buffer: usize,
 ) {
-    let chunk = buffer.drain(..).collect::<Vec<_>>();
-    let text = strip_ansi(&chunk);
-    let text = truncate_if_needed(&text, max_output_buffer);
-
-    // Drop startup noise: everything before the sentinel first appears is the
-    // shell coming up plus our init line. Becoming ready also happens via the
-    // readiness watchdog if the marker never shows.
+    // Startup gate: drop everything until the sentinel prompt first renders, so
+    // the shell coming up + our init line are never shown. The watchdog also
+    // flips readiness if the marker never appears.
     if !prompt_tracker.is_ready() {
-        if prompt_tracker.contains_marker(&text) {
+        if prompt_tracker.contains_marker(&renderer.current_line()) {
             prompt_tracker.mark_ready();
+            renderer.skip_to_cursor();
         }
         return;
     }
 
-    // Detection runs on the raw text (with the marker); the user sees it
-    // redacted and with the command's own echo stripped.
-    let display = prompt_tracker.redact(&text);
-    let display = prompt_tracker.strip_pending_echo(&display);
-    if !display.trim().is_empty() {
-        send_update(stdout_tx, session_id, &display);
+    // Finalized rows above the cursor are the command output. Redact the
+    // sentinel (in case the command line itself carried the prompt) and strip
+    // the command's own echo, then send.
+    let text = renderer.take_completed();
+    if !text.is_empty() {
+        let display = prompt_tracker.redact(&text);
+        let display = prompt_tracker.strip_pending_echo(&display);
+        if !display.trim().is_empty() {
+            let display = truncate_if_needed(&display, max_output_buffer);
+            send_update(stdout_tx, session_id, &display);
+        }
     }
 
-    if prompt_tracker.ends_with_shell_prompt(&text) {
-        // Back at the shell: forget any REPL prompt and finish the turn.
+    // Settle detection runs on the active line — the prompt that's currently
+    // displayed (never emitted as output).
+    let line = renderer.current_line();
+    if prompt_tracker.ends_with_shell_prompt(&line) {
         prompt_tracker.clear_learned();
         prompt_tracker.force_complete();
-    } else if prompt_tracker.ends_with_learned_prompt(&text) {
-        // A REPL prompt we learned earlier (python3 `>>> `, etc.).
+    } else if prompt_tracker.ends_with_learned_prompt(&line) {
         prompt_tracker.force_complete();
     } else {
-        // Unknown trailing line: remember it in case this turn settles by
-        // silence, and reset the idle timer.
-        prompt_tracker.record_trailing(&text);
-        prompt_tracker.notify_output();
+        // Unknown active line (e.g. a REPL prompt): remember it to learn on an
+        // idle settle, and reset the idle timer when there's fresh activity.
+        if !line.is_empty() {
+            prompt_tracker.record_trailing(&line);
+        }
+        if !text.is_empty() || !line.is_empty() {
+            prompt_tracker.notify_output();
+        }
     }
 }
 
@@ -225,9 +235,8 @@ async fn output_read_loop(
     sessions: Arc<DashMap<SessionId, SessionState>>,
     max_output_buffer: usize,
 ) {
-    let mut buffer: Vec<u8> = Vec::new();
+    let mut renderer = TermRenderer::new();
     let flush_interval = Duration::from_millis(100);
-    let max_chunk = 4096usize;
 
     // Readiness watchdog: if the sentinel never appears (integration failed, or
     // the shell is genuinely stuck at an interactive prompt), give up waiting
@@ -250,21 +259,16 @@ async fn output_read_loop(
             bytes = byte_rx.recv() => {
                 match bytes {
                     Some(data) => {
-                        buffer.extend_from_slice(&data);
-                        if buffer.len() >= max_chunk {
-                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
-                        }
+                        renderer.feed(&data);
                     }
                     None => {
-                        if !buffer.is_empty() {
-                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
-                        }
+                        emit_step(&mut renderer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
                         break;
                     }
                 }
             }
-            _ = tokio::time::sleep(flush_interval), if !buffer.is_empty() => {
-                flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
+            _ = tokio::time::sleep(flush_interval), if renderer.pending() || !prompt_tracker.is_ready() => {
+                emit_step(&mut renderer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
             }
         }
     }

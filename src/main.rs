@@ -4,6 +4,7 @@ mod config;
 mod router;
 mod session;
 mod target;
+mod term;
 
 use crate::acp::RpcRequest;
 use crate::router::SessionRouter;

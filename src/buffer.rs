@@ -3,11 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-pub fn strip_ansi(input: &[u8]) -> String {
-    let stripped = strip_ansi_escapes::strip(input);
-    String::from_utf8_lossy(&stripped).into_owned()
-}
-
 pub fn truncate_if_needed(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
@@ -85,30 +80,21 @@ impl PromptTracker {
         *self.pending_echo.lock().unwrap() = Some(cmd.to_string());
     }
 
-    /// Strip a leading echoed-command line. Applied once per turn: if the first
-    /// line of `text` equals the command we wrote, drop it. Cleared on the
-    /// first attempt so a later matching line is never removed by accident.
+    /// Drop the turn's echoed-command line, once per turn. The terminal renders
+    /// the command on the prompt line (`<prompt><command>`), which the line
+    /// editor keeps to a single row even when long (it scrolls horizontally
+    /// rather than wrapping). So the first finalized row of a turn is always
+    /// that echo line — drop it wholesale rather than trying to match content
+    /// (which is impossible once ZLE has scrolled it).
     pub fn strip_pending_echo(&self, text: &str) -> String {
         let mut guard = self.pending_echo.lock().unwrap();
-        let cmd = match guard.as_ref() {
-            Some(c) => c.clone(),
-            None => return text.to_string(),
-        };
+        if guard.is_none() {
+            return text.to_string();
+        }
+        *guard = None;
         match text.find('\n') {
-            Some(nl) if text[..nl].trim_end_matches('\r') == cmd => {
-                *guard = None;
-                text[nl + 1..].to_string()
-            }
-            None if text.trim_end_matches('\r') == cmd => {
-                // Whole chunk is just the echo, newline not flushed yet.
-                *guard = None;
-                String::new()
-            }
-            _ => {
-                // First chunk isn't the echo — give up to avoid stripping later.
-                *guard = None;
-                text.to_string()
-            }
+            Some(nl) => text[nl + 1..].to_string(),
+            None => String::new(),
         }
     }
 

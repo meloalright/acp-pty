@@ -82,10 +82,11 @@ impl LocalTerminalSession {
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         cmd.env("HOME", &home);
-        // TERM=dumb: output goes to IM (ANSI is stripped anyway), and a dumb
-        // terminal disables zsh's ZLE line editor, whose cursor-redraw escape
-        // sequences otherwise leak as garbled text (e.g. "lls", stray "%").
-        cmd.env("TERM", "dumb");
+        // A real headless terminal emulator (see term.rs) interprets the byte
+        // stream, so we advertise a capable terminal and let programs emit
+        // normal escape sequences (colors, cursor moves, ZLE redraws) — the
+        // emulator renders them to clean text. Width matches the PTY.
+        cmd.env("TERM", "xterm-256color");
         cmd.env("LANG", "en_US.UTF-8");
 
         let prompt_tracker = PromptTracker::new();

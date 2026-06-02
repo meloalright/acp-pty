@@ -175,25 +175,26 @@ PTY 输出与 AI 输出有本质区别：PTY 是**连续字节流**（每个字�
 ```
 PTY stdout (连续字节流)
   ↓
-OutputBuffer {
-    buffer: Vec<u8>,
-    last_activity: Instant,
-    flush_timer: tokio::time::Sleep,
-}
-  ↓ 触发条件（任一）
-  ├── 定时 flush：每 100ms flush 一次缓冲
-  ├── 字节上限：buffer ≥ 4096 bytes
-  └── 显式 flush：收到 @shell ctrl-c 等命令时
+TermRenderer (term.rs)              // 无头终端模拟器(vt100),非 strip
+  ├── parser.process(bytes)         // 喂字节,维护屏幕网格
+  └── 每 100ms:
+      ├── take_completed()          // 发射光标行以上"已完成"的行
+      │     · \r 覆盖/进度条 → 折叠为最终态
+      │     · 颜色/光标控制 → 被模拟器解释(纯文本输出,丢色)
+      │     · ZLE 重绘 → 渲染为最终行,无乱码
+      └── current_line()            // 光标行(提示符),仅用于判定本轮结束,不发送
   ↓
-strip_ansi_escapes()  // 清除颜色/光标控制码
+redact(marker) + strip_pending_echo // 抹掉哨兵提示符 + 丢掉命令回显行
   ↓
-truncate_if_needed()  // 超长输出截断，保留头尾
+truncate_if_needed()                // 超长输出截断,保留头尾
   ↓
 session/update notification → cc-connect → IM
 ```
 
+**为什么用真正的终端模拟器而不是 strip**:`strip_ansi` 只是删转义序列,处理不了 `\r` 覆盖(进度条)、光标定位、清屏、ZLE 重绘——删完会留下乱码。`vt100` 把字节流**渲染到一块屏幕网格**,我们读回渲染后的纯文本,这些都被正确处理。
+
 **与 cc-connect 的分工**：
-- shell-acp 负责：字节流聚合、ANSI 清除、语义截断、判断"本轮输出结束"
+- shell-acp 负责：终端模拟渲染、判断"本轮输出结束"、语义截断
 - cc-connect 负责：消息分片（4000 rune）、流式预览编辑、平台 API 调用
 
 **为什么不在 shell-acp 做消息分片**：cc-connect 已经做了，而且它知道各平台的具体限制。shell-acp 只需要输出合理大小的文本块（≤ 8KB），cc-connect 会处理剩下的。
@@ -211,7 +212,7 @@ cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 
 ```
 write_to_pty("ls -la\n")
   ↓
-OutputBuffer 持续聚合 PTY 输出
+TermRenderer 持续渲染 PTY 字节流
   ↓ 每次 flush → 发送 session/update notification（流式推送）
   ↓ 每次 flush → 末行匹配提示符则 force_complete；否则记下末行 + notify_output() 重置静默计时器
   ↓
@@ -345,8 +346,8 @@ shell-acp/
 │   │   ├── spawn_pty()       # portable-pty 启动 shell
 │   │   └── write_to_pty()    # 用户输入写入 stdin
 │   ├── buffer.rs            # 输出缓冲
-│   │   ├── OutputBuffer      # 字节聚合 + 定时 flush
-│   │   ├── strip_ansi()      # ANSI 转义清除
+│   │   ├── TermRenderer      # vt100 无头终端模拟
+│   │   ├── take_completed()  # 渲染已完成行(色/\r/ZLE 已解释)
 │   │   └── PromptTracker     # 提示符匹配(含学习) / 3000ms 静默 / 120s 硬上限，控制 RPC 返回时机
 │   ├── target.rs            # target 绑定
 │   │   └── resolve_target()  # cwd → TargetConfig 映射
@@ -409,8 +410,8 @@ shell-acp 内部：
   ↓
 PTY 执行 ls -la → stdout 输出字节流
   ↓
-buffer.rs: OutputBuffer 聚合（100ms 定时 flush / 4KB 上限）
-  ↓ strip_ansi() 清除控制码
+term.rs: TermRenderer 渲染（vt100 屏幕网格，100ms 发射已完成行）
+  ↓ 颜色/\r/光标控制由模拟器解释为纯文本
   ↓
 shell-acp stdout → session/update 通知（可能多条，流式推送）：
   {"jsonrpc":"2.0","method":"session/update",
@@ -466,19 +467,17 @@ session/prompt RPC 返回: {}
 ### 7.4 输出读取后台循环
 
 ```rust
-async fn output_read_loop(session_id: SessionId, reader: PtyReader, buffer: OutputBuffer) {
-    let mut buf = [0u8; 1024];
+async fn output_read_loop(session_id: SessionId, byte_rx: Receiver, renderer: TermRenderer) {
     loop {
         select! {
-            n = reader.read(&mut buf) => {
-                match n {
-                    Ok(0) => break,
-                    Ok(n) => buffer.append(&buf[..n]),
-                    Err(_) => break,
+            bytes = byte_rx.recv() => {
+                match bytes {
+                    Some(data) => renderer.feed(&data),  // 喂给 vt100 模拟器
+                    None => break,
                 }
             }
-            chunk = buffer.next_flush() => {
-                let text = strip_ansi(&chunk);
+            _ = sleep(100ms), if renderer.pending() => {
+                let text = renderer.take_completed();
                 let text = truncate_if_needed(&text, 8192);
                 send_notification("session/update", json!({
                     "sessionId": session_id,
@@ -668,7 +667,7 @@ shell-acp 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect
 | 未授权用户执行命令 | cc-connect 侧 allow_from + admin_from 拦截，shell-acp 侧 cwd 白名单 |
 | PTY 逃逸 | portable-pty 在独立进程中运行，不共享 shell-acp 的 fd |
 | 环境变量泄露 | ⚠️ 当前实现**继承父进程全部 env**(仅覆盖 HOME/TERM/LANG),见 §9.2 — 待办:收敛为白名单 |
-| 输出注入 IM | strip_ansi 清除控制码，防止在 IM 端渲染异常内容 |
+| 输出注入 IM | vt100 模拟渲染为纯文本,控制序列被解释而非透传,防止 IM 端异常 |
 | 资源耗尽 | 最大并发 session 数限制（默认 16），单 session 输出速率限制 |
 | Shell 进程僵尸 | child process reaper：定期检查 + session 空闲超时自动 kill |
 
@@ -685,7 +684,7 @@ shell-acp 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect
 3. **注入唯一哨兵 PS1**(如 `__SHELLACP_<token>__`),作为确定性提示符判据;展示给用户时从输出里抹掉。zsh 还会清空 `precmd_functions`,bash 清空 `PROMPT_COMMAND`,防止主题动态改写提示符。此外,每轮还会**剥离命令自身的终端回显行**(`set_pending_echo` / `strip_pending_echo`)——用户在 IM 里发的命令已经可见,PTY 回显的那一行属于冗余。
 4. **就绪门 + 看门狗**:哨兵首次出现前的输出(启动噪声/init 行)一律丢弃;**第一条命令在写入前会先等就绪**(`wait_until_ready`),否则 cc-connect 在 `session/new` 后立即发命令时,init 输出会和首条命令输出挤在一起被一起丢弃(表现为首条命令空输出 + 卡满静默窗口)。若 5s 内仍未见哨兵(集成失败或 shell 真卡在交互式提示),打 `warn` 日志并降级为直接展示原始输出,避免“静默无输出”。
 
-环境变量:当前**继承父进程全部 env**,然后覆盖 `HOME` / `TERM=dumb` / `LANG=en_US.UTF-8`(`session.rs`)。`TERM=dumb` 是关键——输出本就要送进 IM(ANSI 会被 strip),而 dumb 终端会**关闭 zsh 的 ZLE 行编辑器**,否则 ZLE 的光标重绘转义序列被 strip 后会留下乱码(如 `lls`、行首 `%`、整行空格)。zsh 启动 init 还会 `unsetopt PROMPT_SP PROMPT_CR` 去掉“部分行 `%` 标记”。
+环境变量:当前**继承父进程全部 env**,然后覆盖 `HOME` / `TERM=xterm-256color` / `LANG=en_US.UTF-8`(`session.rs`)。因为有真正的无头终端模拟器(`term.rs`)在解释字节流,这里**故意 advertise 一个有能力的终端**,让程序正常发颜色/光标/ZLE 序列,由模拟器渲染成干净文本(对比早期 `TERM=dumb`+strip 的规避法)。zsh 启动 init 仍 `unsetopt PROMPT_SP PROMPT_CR` 去掉“部分行 `%` 标记”。
 
 > ⚠️ 注意:这与早期设计设想的“最小化 env 白名单”不同 —— 现状会把父进程的敏感变量(如 `AWS_*`、`GITHUB_TOKEN`)透传进子 shell。**收敛为白名单是一个待办的加固项。**
 
@@ -713,8 +712,8 @@ settle_hard_limit_secs = 120   # 单轮 RPC 返回的硬上限
 | target 绑定 | - | ✅ cwd → shell 映射 |
 | 流式消息编辑 | ✅ 读取 session/update → PreviewStarter | ✅ 发送 session/update notification |
 | 消息分片 | ✅ 4000 rune 切割 | - |
-| 输出缓冲 | - | ✅ 100ms/4KB 聚合 |
-| ANSI 清除 | - | ✅ strip_ansi_escapes |
+| 输出渲染 | - | ✅ vt100 无头终端模拟 |
+| 颜色/光标/\r | - | ✅ 模拟器解释(进度条折叠、ZLE 渲染) |
 | PTY 管理 | - | ✅ portable-pty |
 | 会话生命周期 | - | ✅ start/stop/timeout/reap |
 | 会话恢复 | ✅ 尝试 session/load | ✅ 返回 error，触发 session/new |
