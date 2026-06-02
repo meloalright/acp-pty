@@ -50,13 +50,17 @@ impl SessionRouter {
 
     pub fn create_session(&self, session_id: &str, cwd: &str) -> Result<()> {
         if self.sessions.len() >= self.config.session.max_sessions {
-            return Err(anyhow!("max sessions ({}) reached", self.config.session.max_sessions));
+            return Err(anyhow!(
+                "max sessions ({}) reached",
+                self.config.session.max_sessions
+            ));
         }
 
         let target = resolve_target_or_default(&self.config, cwd);
         let (byte_tx, byte_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let session = LocalTerminalSession::spawn(session_id.to_string(), &target, byte_tx.clone())?;
+        let session =
+            LocalTerminalSession::spawn(session_id.to_string(), &target, byte_tx.clone())?;
 
         let prompt_tracker = session.prompt_tracker.clone();
         let stdout_tx = self.stdout_tx.clone();
@@ -68,10 +72,8 @@ impl SessionRouter {
             output_read_loop(sid, byte_rx, prompt_tracker, stdout_tx, sessions, max_buf).await;
         });
 
-        self.sessions.insert(
-            session_id.to_string(),
-            SessionState { session, byte_tx },
-        );
+        self.sessions
+            .insert(session_id.to_string(), SessionState { session, byte_tx });
 
         Ok(())
     }
@@ -88,7 +90,9 @@ impl SessionRouter {
                 Ok(())
             }
             Some(Command::CtrlC) => {
-                let state = self.sessions.get(session_id)
+                let state = self
+                    .sessions
+                    .get(session_id)
                     .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
                 state.session.send_signal(2)?; // SIGINT
                 send_update(&self.stdout_tx, session_id, "SIGINT sent");
@@ -96,7 +100,9 @@ impl SessionRouter {
             }
             None => {
                 let prompt_tracker = {
-                    let state = self.sessions.get(session_id)
+                    let state = self
+                        .sessions
+                        .get(session_id)
                         .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
                     let input = format!("{}\n", text);
                     state.session.write_to_pty(&input)?;
@@ -111,7 +117,9 @@ impl SessionRouter {
     }
 
     pub fn stop_session(&self, session_id: &str) -> Result<()> {
-        let (_, state) = self.sessions.remove(session_id)
+        let (_, state) = self
+            .sessions
+            .remove(session_id)
             .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
         state.session.kill();
         Ok(())

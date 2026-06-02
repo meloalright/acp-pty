@@ -51,11 +51,7 @@ fn error_response(id: Value, code: i32, message: &str) -> String {
     .unwrap()
 }
 
-pub async fn handle_request(
-    req: RpcRequest,
-    router: &Arc<SessionRouter>,
-    stdout_tx: &StdoutTx,
-) {
+pub async fn handle_request(req: RpcRequest, router: &Arc<SessionRouter>, stdout_tx: &StdoutTx) {
     let id = req.id.clone().unwrap_or(Value::Null);
 
     let response = match req.method.as_str() {
@@ -65,7 +61,11 @@ pub async fn handle_request(
         "session/prompt" => handle_session_prompt(id.clone(), &req.params, router).await,
         "session/list" => handle_session_list(id.clone(), router),
         "session/set_mode" => success_response(id.clone(), json!({})),
-        _ => error_response(id.clone(), -32601, &format!("method not found: {}", req.method)),
+        _ => error_response(
+            id.clone(),
+            -32601,
+            &format!("method not found: {}", req.method),
+        ),
     };
 
     stdout_tx.send(response).ok();
@@ -87,10 +87,7 @@ fn handle_initialize(id: Value) -> String {
 }
 
 fn handle_session_new(id: Value, params: &Value, router: &Arc<SessionRouter>) -> String {
-    let cwd = params
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .unwrap_or(".");
+    let cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
 
     let session_id = format!("pty-{}", uuid::Uuid::new_v4());
 
@@ -117,11 +114,7 @@ async fn handle_session_prompt(id: Value, params: &Value, router: &Arc<SessionRo
     };
 
     if !router.has_session(session_id) {
-        return error_response(
-            id,
-            -32600,
-            &format!("session not found: {}", session_id),
-        );
+        return error_response(id, -32600, &format!("session not found: {}", session_id));
     }
 
     let text = params

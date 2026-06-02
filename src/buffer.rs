@@ -15,7 +15,12 @@ pub fn truncate_if_needed(text: &str, max_bytes: usize) -> String {
     let keep = max_bytes / 2 - 20;
     let head = &text[..keep];
     let tail = &text[text.len() - keep..];
-    format!("{}\n\n... ({} bytes truncated) ...\n\n{}", head, text.len() - keep * 2, tail)
+    format!(
+        "{}\n\n... ({} bytes truncated) ...\n\n{}",
+        head,
+        text.len() - keep * 2,
+        tail
+    )
 }
 
 #[derive(Clone)]

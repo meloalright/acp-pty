@@ -20,9 +20,7 @@ async fn main() {
         )
         .init();
 
-    let config_path = std::env::args()
-        .skip_while(|a| a != "--config")
-        .nth(1);
+    let config_path = std::env::args().skip_while(|a| a != "--config").nth(1);
 
     let config = match config::load_config(config_path.as_deref()) {
         Ok(c) => Arc::new(c),
