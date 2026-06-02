@@ -30,6 +30,6 @@ class ShellAcp < Formula
   end
 
   test do
-    assert_match "shell-acp started", shell_output("echo | #{bin}/shell-acp 2>&1")
+    assert_match version.to_s, shell_output("#{bin}/shell-acp --version")
   end
 end

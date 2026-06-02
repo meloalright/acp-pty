@@ -10,8 +10,37 @@ use crate::router::SessionRouter;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+const HELP: &str = "\
+shell-acp — a shell exposed as an Agent Client Protocol (ACP) agent
+
+shell-acp is an ACP agent: an ACP client (e.g. cc-connect) spawns it as a
+subprocess and speaks JSON-RPC 2.0 over stdio. It is not meant to be run
+interactively in a terminal.
+
+USAGE:
+    shell-acp [--config <path>]
+
+OPTIONS:
+    --config <path>    Path to a TOML config (targets + session settings).
+                       Omitted: sensible defaults (see config.example.toml).
+    -h, --help         Print this help and exit.
+    -V, --version      Print version and exit.
+
+DOCS:
+    https://github.com/meloalright/shell-acp";
+
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{HELP}");
+        return;
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("shell-acp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
