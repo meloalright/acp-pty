@@ -104,10 +104,22 @@ impl SessionRouter {
                         .sessions
                         .get(session_id)
                         .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
-                    let input = format!("{}\n", text);
-                    state.session.write_to_pty(&input)?;
                     state.session.prompt_tracker.clone()
                 };
+                // Wait for the shell to finish startup (sentinel seen) before
+                // typing, so the first command's output isn't swallowed along
+                // with the startup/init noise by the readiness gate.
+                prompt_tracker
+                    .wait_until_ready(Duration::from_secs(5))
+                    .await;
+                {
+                    let state = self
+                        .sessions
+                        .get(session_id)
+                        .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
+                    let input = format!("{}\n", text);
+                    state.session.write_to_pty(&input)?;
+                }
                 prompt_tracker
                     .wait_for_settle(
                         Duration::from_millis(self.config.session.settle_idle_ms),

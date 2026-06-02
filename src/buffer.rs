@@ -105,6 +105,16 @@ impl PromptTracker {
         self.ready.store(true, Ordering::Relaxed);
     }
 
+    /// Block until the shell has finished startup (the sentinel first appeared)
+    /// or `timeout` elapses. Used to gate the first command so its output never
+    /// coalesces with startup/init noise (which the readiness gate drops).
+    pub async fn wait_until_ready(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.is_ready() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Record the trailing line of a flush as the candidate prompt to learn.
     pub fn record_trailing(&self, text: &str) {
         if let Some(line) = trailing_line(text) {
