@@ -25,9 +25,10 @@ pub struct SessionConfig {
     pub max_sessions: usize,
     #[serde(default = "default_max_output_buffer")]
     pub max_output_buffer: usize,
-    /// How long the output must stay silent before a turn is considered
-    /// finished when the shell prompt isn't recognized (e.g. inside a REPL
-    /// like python3 that changes the prompt to `>>> `). Milliseconds.
+    /// How long output must stay silent before a turn finishes when no prompt
+    /// is recognized. Must exceed the per-line cadence of a continuous command
+    /// (e.g. `ping` ~1s) so such streams keep the turn alive and stream live
+    /// rather than being cut off after the first line. Milliseconds.
     #[serde(default = "default_settle_idle_ms")]
     pub settle_idle_ms: u64,
     /// Absolute upper bound on how long a single turn may run before the
@@ -70,7 +71,7 @@ fn default_max_output_buffer() -> usize {
     65536
 }
 fn default_settle_idle_ms() -> u64 {
-    800
+    1500
 }
 fn default_settle_hard_limit_secs() -> u64 {
     120

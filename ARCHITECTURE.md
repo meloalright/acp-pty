@@ -202,8 +202,10 @@ session/update notification → cc-connect → IM
 
 cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 `EventResult(Done=true)`，finalize IM 消息）。所以 shell-acp 不能立即返回,必须等 PTY 输出稳定后再返回。本轮结束有三个触发条件,**任一满足即返回**:
 
-1. **提示符匹配(快路径)** — 输出末尾出现会话启动时捕获的 shell 提示符,立即返回。普通 shell 命令走这条。
-2. **静默兜底** — 输出连续 `settle_idle_ms`(默认 800ms)无新数据时返回。用于**提示符识别不了**的场景:`python3` / `node` / `mysql` 等嵌套 REPL 会把提示符换成 `>>> ` / `mysql>`,跟启动时的 shell 提示符对不上,只能靠静默判定本轮结束。
+1. **提示符匹配(快路径)** — 输出末尾出现已知提示符,立即返回。已知提示符有两种:
+   - **shell 提示符** — 会话第一段输出的末行(如 `root@host:/root#`),普通命令走这条;匹配到时还会清掉已学习的 REPL 提示符(说明已回到 shell)。
+   - **学习到的 REPL 提示符** — 见下条。匹配到 `python3` 的 `>>> `、`mysql>`、`node >` 等时立即返回。
+2. **静默兜底 + 提示符学习** — 提示符还没学到时,输出连续 `settle_idle_ms`(默认 1500ms)无新数据则返回,**并把这次的末行学习为 REPL 提示符**,于是第二条起的同类命令就能走快路径。窗口必须**大于持续命令的出行间隔**(如 `ping` 约 1s/行),这样 `ping` / `tail -f` / `watch` 这类**持续流**才能不断重置计时器、保持本轮存活、实时刷,而不是出一行就被收尾。
 3. **硬上限** — 超过 `settle_hard_limit_secs`(默认 120s)强制返回。
 
 ```
@@ -211,23 +213,24 @@ write_to_pty("ls -la\n")
   ↓
 OutputBuffer 持续聚合 PTY 输出
   ↓ 每次 flush → 发送 session/update notification（流式推送）
-  ↓ 每次 flush → notify_output() 重置静默计时器
+  ↓ 每次 flush → 末行匹配提示符则 force_complete；否则记下末行 + notify_output() 重置静默计时器
   ↓
-满足任一结束条件（提示符匹配 / 800ms 静默 / 120s 硬上限）
-  ↓
+满足任一结束条件（提示符匹配 / 1500ms 静默 / 120s 硬上限）
+  ↓ 若按静默结束 → 把末行学习为 REPL 提示符
 返回 session/prompt RPC response: {"jsonrpc":"2.0","id":3,"result":{}}
   ↓
 cc-connect: EventResult(Done=true) → finalize IM 消息
 ```
 
-**安全阀：硬上限默认 120 秒**。长命令（`cargo build`、`make`）可能持续输出数分钟。超过硬上限后强制返回 RPC，后续输出继续通过 notification best-effort 推送（cc-connect 可能显示为新消息）。
+**安全阀：硬上限默认 120 秒**。长命令（`cargo build`、`make`）或不会自己停的持续流（`ping`、`tail -f`）可能持续输出数分钟。超过硬上限后强制返回 RPC，后续输出继续通过 notification best-effort 推送（cc-connect 可能显示为新消息）。持续流建议用有界形式(`ping -c 6`)或 `@shell ctrl-c` 收尾。
 
 | 场景 | 行为 |
 |---|---|
-| 普通 shell 命令（ls, pwd, cat） | 输出完毕、shell 提示符重现 → 提示符匹配，立即返回 |
-| 进入 REPL（python3, node, mysql） | 提示符变为 `>>> ` 等,匹配不上 → 静默 800ms 后返回 |
-| 长命令（cargo build） | notification 流式推送,达到 120s 硬上限时强制返回 RPC，后续 best-effort |
-| 无输出命令（cd, export） | 写入 PTY 后 800ms 无输出，直接返回 |
+| 普通 shell 命令（ls, pwd, cat） | 输出完毕、shell 提示符重现 → 提示符匹配，立即返回（~0.1s） |
+| 进入 REPL（python3, node, mysql） | 首次靠静默 1500ms 返回并学习 `>>> ` 等;之后同类命令提示符匹配立即返回 |
+| 持续流（ping, tail -f, watch） | 每行间隔 < 1500ms,不断重置计时器 → 本轮存活、实时流式推送,直到命令结束/ctrl-c/120s 硬上限 |
+| 长命令（cargo build） | notification 流式推送,结束时 shell 提示符重现立即返回;否则 120s 硬上限强制返回 |
+| 无输出命令（cd, export） | 提示符立即重现 → 匹配返回 |
 
 ## 5. 权限模型：从 cc-connect 学到的
 
@@ -344,7 +347,7 @@ shell-acp/
 │   ├── buffer.rs            # 输出缓冲
 │   │   ├── OutputBuffer      # 字节聚合 + 定时 flush
 │   │   ├── strip_ansi()      # ANSI 转义清除
-│   │   └── PromptTracker     # 提示符匹配 / 800ms 静默 / 120s 硬上限，控制 RPC 返回时机
+│   │   └── PromptTracker     # 提示符匹配(含学习) / 1500ms 静默 / 120s 硬上限，控制 RPC 返回时机
 │   ├── target.rs            # target 绑定
 │   │   └── resolve_target()  # cwd → TargetConfig 映射
 │   └── config.rs            # TOML 配置加载
@@ -420,7 +423,7 @@ cc-connect 实时处理 notification
   ↓ StreamPreview / UpdateMessage 实时编辑 IM 消息
   ↓ 超长则 splitMessage() 分片
   ↓
-提示符重现，或 800ms 静默无新输出（或 120s 硬上限）
+提示符重现，或 1500ms 静默无新输出（或 120s 硬上限）
   ↓
 shell-acp 返回 prompt RPC 响应：
   {"jsonrpc":"2.0","id":3,"result":{}}
@@ -591,7 +594,7 @@ shell-acp 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **
 {"jsonrpc":"2.0","id":3,"result":{}}
 ```
 
-**关键**：`session/prompt` 的 RPC 响应在 PTY 输出稳定后才返回（提示符匹配 / 800ms 静默 / 120s 硬上限,任一触发）。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。RPC 返回后 cc-connect 触发 `EventResult(Done=true)` finalize IM 消息。
+**关键**：`session/prompt` 的 RPC 响应在 PTY 输出稳定后才返回（提示符匹配 / 1500ms 静默 / 120s 硬上限,任一触发）。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。RPC 返回后 cc-connect 触发 `EventResult(Done=true)` finalize IM 消息。
 
 **session/load（始终失败）**
 
@@ -690,7 +693,7 @@ fn filtered_env() -> Vec<(String, String)> {
 idle_timeout_secs = 1800       # 30 分钟无输入自动销毁
 max_sessions = 16              # 全局最大并发会话
 max_output_buffer = 65536      # 单次输出缓冲上限 64KB
-settle_idle_ms = 800           # 提示符识别不了时,静默多久判定本轮结束
+settle_idle_ms = 1500          # 提示符未学到时,静默多久判定本轮结束(须>持续流出行间隔)
 settle_hard_limit_secs = 120   # 单轮 RPC 返回的硬上限
 ```
 

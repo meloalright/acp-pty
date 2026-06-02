@@ -179,9 +179,17 @@ fn flush_and_notify(
 
     send_update(stdout_tx, session_id, &text);
 
-    if prompt_tracker.output_ends_with_prompt(&text) {
+    if prompt_tracker.ends_with_shell_prompt(&text) {
+        // Back at the shell: forget any REPL prompt and finish the turn.
+        prompt_tracker.clear_learned();
+        prompt_tracker.force_complete();
+    } else if prompt_tracker.ends_with_learned_prompt(&text) {
+        // A REPL prompt we learned earlier (python3 `>>> `, etc.).
         prompt_tracker.force_complete();
     } else {
+        // Unknown trailing line: remember it in case this turn settles by
+        // silence, and reset the idle timer.
+        prompt_tracker.record_trailing(&text);
         prompt_tracker.notify_output();
     }
 }
