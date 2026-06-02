@@ -181,7 +181,7 @@ OutputBuffer {
     flush_timer: tokio::time::Sleep,
 }
   ↓ 触发条件（任一）
-  ├── 静默超时：最后一次 read 后 300ms 无新数据
+  ├── 定时 flush：每 100ms flush 一次缓冲
   ├── 字节上限：buffer ≥ 4096 bytes
   └── 显式 flush：收到 @shell ctrl-c 等命令时
   ↓
@@ -200,30 +200,34 @@ session/update notification → cc-connect → IM
 
 ### session/prompt 的 RPC 返回时机
 
-cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 `EventResult(Done=true)`，finalize IM 消息）。所以 shell-acp 不能立即返回，必须等 PTY 输出稳定后再返回。
+cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 `EventResult(Done=true)`，finalize IM 消息）。所以 shell-acp 不能立即返回,必须等 PTY 输出稳定后再返回。本轮结束有三个触发条件,**任一满足即返回**:
+
+1. **提示符匹配(快路径)** — 输出末尾出现会话启动时捕获的 shell 提示符,立即返回。普通 shell 命令走这条。
+2. **静默兜底** — 输出连续 `settle_idle_ms`(默认 800ms)无新数据时返回。用于**提示符识别不了**的场景:`python3` / `node` / `mysql` 等嵌套 REPL 会把提示符换成 `>>> ` / `mysql>`,跟启动时的 shell 提示符对不上,只能靠静默判定本轮结束。
+3. **硬上限** — 超过 `settle_hard_limit_secs`(默认 120s)强制返回。
 
 ```
 write_to_pty("ls -la\n")
   ↓
 OutputBuffer 持续聚合 PTY 输出
   ↓ 每次 flush → 发送 session/update notification（流式推送）
+  ↓ 每次 flush → notify_output() 重置静默计时器
   ↓
-最后一次 flush 后，再等一个 300ms 静默窗口
-  ↓ 确认无新输出
+满足任一结束条件（提示符匹配 / 800ms 静默 / 120s 硬上限）
   ↓
 返回 session/prompt RPC response: {"jsonrpc":"2.0","id":3,"result":{}}
   ↓
 cc-connect: EventResult(Done=true) → finalize IM 消息
 ```
 
-**安全阀：30 秒硬上限**。长命令（`cargo build`、`make`）可能持续输出数分钟。超过 30 秒后强制返回 RPC，后续输出继续通过 notification best-effort 推送（cc-connect 可能显示为新消息）。
+**安全阀：硬上限默认 120 秒**。长命令（`cargo build`、`make`）可能持续输出数分钟。超过硬上限后强制返回 RPC，后续输出继续通过 notification best-effort 推送（cc-connect 可能显示为新消息）。
 
 | 场景 | 行为 |
 |---|---|
-| 快命令（ls, pwd, cat） | 输出秒完，300ms 静默后返回 |
-| 中等命令（cargo test） | 输出几秒内结束，300ms 静默后返回 |
-| 长命令（cargo build） | 前 30s 输出 + notification 流式推送，30s 时强制返回 RPC，后续 best-effort |
-| 无输出命令（cd, export） | 写入 PTY 后 300ms 无输出，直接返回 |
+| 普通 shell 命令（ls, pwd, cat） | 输出完毕、shell 提示符重现 → 提示符匹配，立即返回 |
+| 进入 REPL（python3, node, mysql） | 提示符变为 `>>> ` 等,匹配不上 → 静默 800ms 后返回 |
+| 长命令（cargo build） | notification 流式推送,达到 120s 硬上限时强制返回 RPC，后续 best-effort |
+| 无输出命令（cd, export） | 写入 PTY 后 800ms 无输出，直接返回 |
 
 ## 5. 权限模型：从 cc-connect 学到的
 
@@ -340,7 +344,7 @@ shell-acp/
 │   ├── buffer.rs            # 输出缓冲
 │   │   ├── OutputBuffer      # 字节聚合 + 定时 flush
 │   │   ├── strip_ansi()      # ANSI 转义清除
-│   │   └── PromptTracker     # 300ms 静默 / 30s 硬上限，控制 RPC 返回时机
+│   │   └── PromptTracker     # 提示符匹配 / 800ms 静默 / 120s 硬上限，控制 RPC 返回时机
 │   ├── target.rs            # target 绑定
 │   │   └── resolve_target()  # cwd → TargetConfig 映射
 │   └── config.rs            # TOML 配置加载
@@ -402,7 +406,7 @@ shell-acp 内部：
   ↓
 PTY 执行 ls -la → stdout 输出字节流
   ↓
-buffer.rs: OutputBuffer 聚合（300ms 静默 / 4KB 上限）
+buffer.rs: OutputBuffer 聚合（100ms 定时 flush / 4KB 上限）
   ↓ strip_ansi() 清除控制码
   ↓
 shell-acp stdout → session/update 通知（可能多条，流式推送）：
@@ -416,7 +420,7 @@ cc-connect 实时处理 notification
   ↓ StreamPreview / UpdateMessage 实时编辑 IM 消息
   ↓ 超长则 splitMessage() 分片
   ↓
-最后一次 buffer flush 后 300ms 无新输出（或 30s 硬上限）
+提示符重现，或 800ms 静默无新输出（或 120s 硬上限）
   ↓
 shell-acp 返回 prompt RPC 响应：
   {"jsonrpc":"2.0","id":3,"result":{}}
@@ -500,11 +504,11 @@ async fn handle_session_prompt(session_id, prompt_text) -> RpcResult {
     let session = sessions.get(&session_id)?;
     session.write_to_pty(format!("{}\n", prompt_text));
 
-    // 等待输出稳定：300ms 静默 或 30s 硬上限
+    // 等待输出稳定：提示符匹配 / 静默兜底 / 硬上限
     let tracker = session.prompt_tracker.clone();
     tracker.wait_for_settle(
-        silence: Duration::from_millis(300),
-        hard_limit: Duration::from_secs(30),
+        idle_window: Duration::from_millis(settle_idle_ms),      // 默认 800
+        hard_limit:  Duration::from_secs(settle_hard_limit_secs), // 默认 120
     ).await;
 
     Ok(json!({}))
@@ -512,8 +516,10 @@ async fn handle_session_prompt(session_id, prompt_text) -> RpcResult {
 ```
 
 `PromptTracker` 的逻辑：
-- `notify_output()` — output_read_loop 每次 flush 后调用，重置 300ms 静默计时器
-- `wait_for_settle()` — 阻塞直到 300ms 无新 notify_output，或 30s 硬上限到达
+- `set_shell_prompt()` — 会话第一段输出时捕获 shell 提示符,作为快路径判据
+- `output_ends_with_prompt()` → `force_complete()` — 输出末尾匹配提示符则立即结束本轮
+- `notify_output()` — output_read_loop 每次 flush 后调用，**重置静默计时器**
+- `wait_for_settle()` — 阻塞直到以下任一:提示符匹配、连续 `idle_window` 无新 `notify_output`、或 `hard_limit` 硬上限
 - `@shell ctrl-c` / `@shell stop` 命令直接完成 tracker，立即返回 RPC
 
 ## 8. ACP 协议实现
@@ -585,7 +591,7 @@ shell-acp 实现 ACP（Agent Client Protocol）的最小子集。传输层为 **
 {"jsonrpc":"2.0","id":3,"result":{}}
 ```
 
-**关键**：`session/prompt` 的 RPC 响应在 PTY 输出稳定后才返回（300ms 静默超时 或 30s 硬上限）。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。RPC 返回后 cc-connect 触发 `EventResult(Done=true)` finalize IM 消息。
+**关键**：`session/prompt` 的 RPC 响应在 PTY 输出稳定后才返回（提示符匹配 / 800ms 静默 / 120s 硬上限,任一触发）。中间的输出通过 `session/update` notification 异步推送（无 `id` 字段）。cc-connect 收到 notification 后实时编辑 IM 消息。RPC 返回后 cc-connect 触发 `EventResult(Done=true)` finalize IM 消息。
 
 **session/load（始终失败）**
 
@@ -681,9 +687,11 @@ fn filtered_env() -> Vec<(String, String)> {
 
 ```toml
 [session]
-idle_timeout_secs = 1800    # 30 分钟无输入自动销毁
-max_sessions = 16           # 全局最大并发会话
-max_output_buffer = 65536   # 单次输出缓冲上限 64KB
+idle_timeout_secs = 1800       # 30 分钟无输入自动销毁
+max_sessions = 16              # 全局最大并发会话
+max_output_buffer = 65536      # 单次输出缓冲上限 64KB
+settle_idle_ms = 800           # 提示符识别不了时,静默多久判定本轮结束
+settle_hard_limit_secs = 120   # 单轮 RPC 返回的硬上限
 ```
 
 ## 10. 从 cc-connect 借鉴 vs 自己实现 — 总结
@@ -699,7 +707,7 @@ max_output_buffer = 65536   # 单次输出缓冲上限 64KB
 | target 绑定 | - | ✅ cwd → shell 映射 |
 | 流式消息编辑 | ✅ 读取 session/update → PreviewStarter | ✅ 发送 session/update notification |
 | 消息分片 | ✅ 4000 rune 切割 | - |
-| 输出缓冲 | - | ✅ 300ms/4KB 聚合 |
+| 输出缓冲 | - | ✅ 100ms/4KB 聚合 |
 | ANSI 清除 | - | ✅ strip_ansi_escapes |
 | PTY 管理 | - | ✅ portable-pty |
 | 会话生命周期 | - | ✅ start/stop/timeout/reap |

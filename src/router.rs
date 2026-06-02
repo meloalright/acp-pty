@@ -109,7 +109,10 @@ impl SessionRouter {
                     state.session.prompt_tracker.clone()
                 };
                 prompt_tracker
-                    .wait_for_settle(Duration::from_secs(120))
+                    .wait_for_settle(
+                        Duration::from_millis(self.config.session.settle_idle_ms),
+                        Duration::from_secs(self.config.session.settle_hard_limit_secs),
+                    )
                     .await;
                 Ok(())
             }

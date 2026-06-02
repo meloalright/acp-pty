@@ -25,6 +25,15 @@ pub struct SessionConfig {
     pub max_sessions: usize,
     #[serde(default = "default_max_output_buffer")]
     pub max_output_buffer: usize,
+    /// How long the output must stay silent before a turn is considered
+    /// finished when the shell prompt isn't recognized (e.g. inside a REPL
+    /// like python3 that changes the prompt to `>>> `). Milliseconds.
+    #[serde(default = "default_settle_idle_ms")]
+    pub settle_idle_ms: u64,
+    /// Absolute upper bound on how long a single turn may run before the
+    /// prompt RPC is returned regardless. Seconds.
+    #[serde(default = "default_settle_hard_limit_secs")]
+    pub settle_hard_limit_secs: u64,
 }
 
 impl Default for SessionConfig {
@@ -33,6 +42,8 @@ impl Default for SessionConfig {
             idle_timeout_secs: default_idle_timeout(),
             max_sessions: default_max_sessions(),
             max_output_buffer: default_max_output_buffer(),
+            settle_idle_ms: default_settle_idle_ms(),
+            settle_hard_limit_secs: default_settle_hard_limit_secs(),
         }
     }
 }
@@ -57,6 +68,12 @@ fn default_max_sessions() -> usize {
 }
 fn default_max_output_buffer() -> usize {
     65536
+}
+fn default_settle_idle_ms() -> u64 {
+    800
+}
+fn default_settle_hard_limit_secs() -> u64 {
+    120
 }
 
 pub fn load_config(path: Option<&str>) -> anyhow::Result<Config> {

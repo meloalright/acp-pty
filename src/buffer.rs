@@ -62,12 +62,33 @@ impl PromptTracker {
         }
     }
 
-    pub async fn wait_for_settle(&self, hard_limit: Duration) {
+    /// Block until the current turn settles, then return so the prompt RPC
+    /// can be answered. A turn ends when any of these happens first:
+    ///   * the recognized shell prompt reappears (`force_complete`) — fast path;
+    ///   * the output stays silent for `idle_window` — fallback that makes
+    ///     nested REPLs (python3, mysql, node, …) responsive even though their
+    ///     prompt isn't the shell prompt we captured at startup;
+    ///   * `hard_limit` elapses — absolute upper bound.
+    pub async fn wait_for_settle(&self, idle_window: Duration, hard_limit: Duration) {
         self.active.store(true, Ordering::Relaxed);
 
-        tokio::select! {
-            _ = self.completed.notified() => {}
-            _ = tokio::time::sleep(hard_limit) => {}
+        let deadline = tokio::time::Instant::now() + hard_limit;
+
+        loop {
+            // Register interest before selecting so output that arrives while
+            // we set up the select still wakes us (tokio::Notify holds one
+            // permit for an un-awaited notify_one).
+            let new_output = self.notify.notified();
+
+            tokio::select! {
+                _ = self.completed.notified() => break,
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = tokio::time::sleep(idle_window) => break,
+                _ = new_output => {
+                    // Fresh output: reset the idle timer and keep waiting.
+                    continue;
+                }
+            }
         }
 
         self.active.store(false, Ordering::Relaxed);
