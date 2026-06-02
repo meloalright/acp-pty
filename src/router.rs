@@ -164,20 +164,27 @@ fn flush_and_notify(
     stdout_tx: &StdoutTx,
     session_id: &str,
     max_output_buffer: usize,
-    is_first: &mut bool,
 ) {
     let chunk = buffer.drain(..).collect::<Vec<_>>();
     let text = strip_ansi(&chunk);
     let text = truncate_if_needed(&text, max_output_buffer);
 
-    if *is_first {
-        prompt_tracker.set_shell_prompt(&text);
-        *is_first = false;
-        send_update(stdout_tx, session_id, &text);
+    // Drop startup noise: everything before the sentinel first appears is the
+    // shell coming up plus our init line. Becoming ready also happens via the
+    // readiness watchdog if the marker never shows.
+    if !prompt_tracker.is_ready() {
+        if prompt_tracker.contains_marker(&text) {
+            prompt_tracker.mark_ready();
+        }
         return;
     }
 
-    send_update(stdout_tx, session_id, &text);
+    // Detection runs on the raw text (with the marker); the user sees it
+    // redacted.
+    let display = prompt_tracker.redact(&text);
+    if !display.trim().is_empty() {
+        send_update(stdout_tx, session_id, &display);
+    }
 
     if prompt_tracker.ends_with_shell_prompt(&text) {
         // Back at the shell: forget any REPL prompt and finish the turn.
@@ -205,7 +212,22 @@ async fn output_read_loop(
     let mut buffer: Vec<u8> = Vec::new();
     let flush_interval = Duration::from_millis(100);
     let max_chunk = 4096usize;
-    let mut is_first = true;
+
+    // Readiness watchdog: if the sentinel never appears (integration failed, or
+    // the shell is genuinely stuck at an interactive prompt), give up waiting
+    // after a few seconds so output is shown rather than silently swallowed.
+    let watchdog = prompt_tracker.clone();
+    let watchdog_sid = session_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if !watchdog.is_ready() {
+            tracing::warn!(
+                session_id = %watchdog_sid,
+                "prompt marker not seen within 5s; shell may be stuck at an interactive prompt — showing raw output"
+            );
+            watchdog.mark_ready();
+        }
+    });
 
     loop {
         tokio::select! {
@@ -214,19 +236,19 @@ async fn output_read_loop(
                     Some(data) => {
                         buffer.extend_from_slice(&data);
                         if buffer.len() >= max_chunk {
-                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut is_first);
+                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut is_first);
+                            flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
                         }
                         break;
                     }
                 }
             }
             _ = tokio::time::sleep(flush_interval), if !buffer.is_empty() => {
-                flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut is_first);
+                flush_and_notify(&mut buffer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
             }
         }
     }

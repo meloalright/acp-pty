@@ -203,7 +203,7 @@ session/update notification → cc-connect → IM
 cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 `EventResult(Done=true)`，finalize IM 消息）。所以 shell-acp 不能立即返回,必须等 PTY 输出稳定后再返回。本轮结束有三个触发条件,**任一满足即返回**:
 
 1. **提示符匹配(快路径)** — 输出末尾出现已知提示符,立即返回。已知提示符有两种:
-   - **shell 提示符** — 会话第一段输出的末行(如 `root@host:/root#`),普通命令走这条;匹配到时还会清掉已学习的 REPL 提示符(说明已回到 shell)。
+   - **shell 提示符(哨兵)** — 会话启动时 shell-acp 注入了一个唯一的哨兵 PS1(见 §9.2 shell 集成),普通命令走这条;它是**确定性精确匹配**,不受 oh-my-zsh / 主题 / 颜色影响。匹配到时还会清掉已学习的 REPL 提示符(说明已回到 shell)。哨兵会从展示给用户的输出里**抹掉**。
    - **学习到的 REPL 提示符** — 见下条。匹配到 `python3` 的 `>>> `、`mysql>`、`node >` 等时立即返回。
 2. **静默兜底 + 提示符学习** — 提示符还没学到时,输出连续 `settle_idle_ms`(默认 3000ms)无新数据则返回,**并把这次的末行学习为 REPL 提示符**,于是第二条起的同类命令就能走快路径。窗口必须**大于持续命令的出行间隔**(`ping` 约 1s/行、`watch` 默认 2s),这样 `ping` / `tail -f` / `watch` 这类**持续流**才能不断重置计时器、保持本轮存活、实时刷,而不是出一行就被收尾。
 3. **硬上限** — 超过 `settle_hard_limit_secs`(默认 120s)强制返回。
@@ -519,7 +519,7 @@ async fn handle_session_prompt(session_id, prompt_text) -> RpcResult {
 ```
 
 `PromptTracker` 的逻辑：
-- `set_shell_prompt()` — 会话第一段输出时捕获 shell 提示符,作为快路径判据
+- `set_marker()` — 会话启动时设入注入的哨兵 PS1,作为快路径精确匹配判据;并用于从输出中抹掉哨兵
 - `output_ends_with_prompt()` → `force_complete()` — 输出末尾匹配提示符则立即结束本轮
 - `notify_output()` — output_read_loop 每次 flush 后调用，**重置静默计时器**
 - `wait_for_settle()` — 阻塞直到以下任一:提示符匹配、连续 `idle_window` 无新 `notify_output`、或 `hard_limit` 硬上限
@@ -667,24 +667,27 @@ shell-acp 的日志写 stderr，不干扰 stdin/stdout 协议通道。cc-connect
 |---|---|
 | 未授权用户执行命令 | cc-connect 侧 allow_from + admin_from 拦截，shell-acp 侧 cwd 白名单 |
 | PTY 逃逸 | portable-pty 在独立进程中运行，不共享 shell-acp 的 fd |
-| 环境变量泄露 | spawn_pty 使用最小化 env，不继承 shell-acp 的全部环境 |
+| 环境变量泄露 | ⚠️ 当前实现**继承父进程全部 env**(仅覆盖 HOME/TERM/LANG),见 §9.2 — 待办:收敛为白名单 |
 | 输出注入 IM | strip_ansi 清除控制码，防止在 IM 端渲染异常内容 |
 | 资源耗尽 | 最大并发 session 数限制（默认 16），单 session 输出速率限制 |
 | Shell 进程僵尸 | child process reaper：定期检查 + session 空闲超时自动 kill |
 
-### 9.2 最小化环境变量
+### 9.2 Shell 集成(干净启动 + 哨兵提示符)与环境
 
-```rust
-fn filtered_env() -> Vec<(String, String)> {
-    vec![
-        ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        ("HOME", &target.cwd),
-        ("TERM", "xterm-256color"),
-        ("LANG", "en_US.UTF-8"),
-        // 不继承：AWS_*, GITHUB_TOKEN, SSH_*, 等
-    ]
-}
-```
+为了**鲁棒性**(不被 shell 启动期的交互式步骤卡住)和**确定性提示符检测**,`session.rs` 这样起 shell:
+
+1. **不读 rc/profile 启动**,避免任何首次运行向导拦截 —— 尤其是没有 `~/.zshrc` 时 zsh 会跑 `zsh-newuser-install` 向导卡住:
+   - zsh:`zsh -f -i`
+   - bash:`bash --norc --noprofile -i`
+   - 其他:`<shell> -i`
+2. **自己补 source 用户 rc**,保留用户的 alias/PATH 等(向导已被上一步规避):
+   - 如 `[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"`
+3. **注入唯一哨兵 PS1**(如 `__SHELLACP_<token>__`),作为确定性提示符判据;展示给用户时从输出里抹掉。zsh 还会清空 `precmd_functions`,bash 清空 `PROMPT_COMMAND`,防止主题动态改写提示符。
+4. **就绪看门狗**:哨兵首次出现前的输出(启动噪声/init 行)一律丢弃;若 5s 内仍未见哨兵(集成失败或 shell 真卡在交互式提示),打 `warn` 日志并降级为直接展示原始输出,避免“静默无输出”。
+
+环境变量:当前**继承父进程全部 env**,然后覆盖 `HOME` / `TERM=xterm-256color` / `LANG=en_US.UTF-8`(`session.rs`)。
+
+> ⚠️ 注意:这与早期设计设想的“最小化 env 白名单”不同 —— 现状会把父进程的敏感变量(如 `AWS_*`、`GITHUB_TOKEN`)透传进子 shell。**收敛为白名单是一个待办的加固项。**
 
 ### 9.3 空闲超时
 

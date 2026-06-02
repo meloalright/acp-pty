@@ -44,7 +44,8 @@ pub struct PromptTracker {
     notify: Arc<Notify>,
     active: Arc<AtomicBool>,
     completed: Arc<Notify>,
-    /// The shell's own prompt, captured from the session's first output.
+    /// The shell prompt we match against — an injected sentinel marker (see
+    /// `set_marker`). Deterministic regardless of theme / oh-my-zsh / colors.
     shell_prompt: Arc<Mutex<Option<String>>>,
     /// A prompt learned at runtime — the trailing line seen the last time a
     /// turn settled by silence. Lets nested REPLs (python3 `>>> `, `mysql>`,
@@ -52,6 +53,12 @@ pub struct PromptTracker {
     learned_prompt: Arc<Mutex<Option<String>>>,
     /// Trailing line of the most recent flush, the candidate to be learned.
     last_trailing: Arc<Mutex<Option<String>>>,
+    /// The sentinel string injected as PS1; redacted from displayed output.
+    marker: Arc<Mutex<Option<String>>>,
+    /// Set once the sentinel has first appeared (shell is up and integrated),
+    /// or once the readiness watchdog gives up. Output before this is startup
+    /// noise and is dropped.
+    ready: Arc<AtomicBool>,
 }
 
 impl PromptTracker {
@@ -63,14 +70,39 @@ impl PromptTracker {
             shell_prompt: Arc::new(Mutex::new(None)),
             learned_prompt: Arc::new(Mutex::new(None)),
             last_trailing: Arc::new(Mutex::new(None)),
+            marker: Arc::new(Mutex::new(None)),
+            ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Capture the shell prompt from the first output (its trailing line).
-    pub fn set_shell_prompt(&self, text: &str) {
-        if let Some(line) = trailing_line(text) {
-            *self.shell_prompt.lock().unwrap() = Some(line);
+    /// Register the injected sentinel as both the prompt to match and the
+    /// string to redact from displayed output.
+    pub fn set_marker(&self, marker: &str) {
+        *self.shell_prompt.lock().unwrap() = Some(marker.to_string());
+        *self.marker.lock().unwrap() = Some(marker.to_string());
+    }
+
+    pub fn contains_marker(&self, text: &str) -> bool {
+        match &*self.marker.lock().unwrap() {
+            Some(m) if !m.is_empty() => text.contains(m.as_str()),
+            _ => false,
         }
+    }
+
+    /// Strip the sentinel from text before it is shown to the user.
+    pub fn redact(&self, text: &str) -> String {
+        match &*self.marker.lock().unwrap() {
+            Some(m) if !m.is_empty() => text.replace(m.as_str(), ""),
+            _ => text.to_string(),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Relaxed);
     }
 
     /// Record the trailing line of a flush as the candidate prompt to learn.

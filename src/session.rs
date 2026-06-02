@@ -6,6 +6,18 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
+/// A per-session sentinel used as the shell prompt. Unique, alphanumeric, and
+/// redacted from output, so prompt detection is exact regardless of the user's
+/// theme and the marker is never shown to the user.
+fn prompt_marker(session_id: &str) -> String {
+    let token: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    format!("__SHELLACP_{}__", token)
+}
+
 pub struct LocalTerminalSession {
     pub session_id: String,
     pub target: TargetConfig,
@@ -29,8 +41,36 @@ impl LocalTerminalSession {
             pixel_height: 0,
         })?;
 
+        // Launch the shell WITHOUT its rc/profile so no interactive first-run
+        // step can hang us (notably zsh's `zsh-newuser-install` wizard when
+        // there is no ~/.zshrc). We re-source the user's rc ourselves from the
+        // init line below, then pin a deterministic sentinel prompt.
+        let shell_name = target
+            .shell
+            .rsplit('/')
+            .next()
+            .unwrap_or(target.shell.as_str());
+        let marker = prompt_marker(&session_id);
+
         let mut cmd = CommandBuilder::new(&target.shell);
-        cmd.args(["-l"]);
+        let init = if shell_name.contains("zsh") {
+            cmd.args(["-f", "-i"]);
+            format!(
+                "[ -f \"$HOME/.zshrc\" ] && source \"$HOME/.zshrc\" >/dev/null 2>&1; \
+                 precmd_functions=(); precmd() {{ :; }}; PS1='{m}'\n",
+                m = marker
+            )
+        } else if shell_name.contains("bash") {
+            cmd.args(["--norc", "--noprofile", "-i"]);
+            format!(
+                "[ -f \"$HOME/.bashrc\" ] && source \"$HOME/.bashrc\" >/dev/null 2>&1; \
+                 PROMPT_COMMAND=''; PS1='{m}'\n",
+                m = marker
+            )
+        } else {
+            cmd.args(["-i"]);
+            format!("PS1='{m}'\n", m = marker)
+        };
         cmd.cwd(&target.cwd);
 
         for (key, val) in std::env::vars() {
@@ -41,10 +81,15 @@ impl LocalTerminalSession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("LANG", "en_US.UTF-8");
 
+        let prompt_tracker = PromptTracker::new();
+        prompt_tracker.set_marker(&marker);
+
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
-        let writer = pair.master.take_writer()?;
+        let mut writer = pair.master.take_writer()?;
+        writer.write_all(init.as_bytes())?;
+        writer.flush()?;
         let mut reader = pair.master.try_clone_reader()?;
 
         let reader_handle = std::thread::spawn(move || {
@@ -65,7 +110,7 @@ impl LocalTerminalSession {
         Ok(Self {
             session_id,
             target: target.clone(),
-            prompt_tracker: PromptTracker::new(),
+            prompt_tracker,
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             _reader_handle: reader_handle,
