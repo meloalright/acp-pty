@@ -57,6 +57,9 @@ pub struct PromptTracker {
     /// or once the readiness watchdog gives up. Output before this is startup
     /// noise and is dropped.
     ready: Arc<AtomicBool>,
+    /// Whether the current turn has an open Markdown code fence (opened on the
+    /// first output chunk, closed after the turn settles).
+    fence_open: Arc<AtomicBool>,
 }
 
 impl PromptTracker {
@@ -71,6 +74,7 @@ impl PromptTracker {
             marker: Arc::new(Mutex::new(None)),
             ready: Arc::new(AtomicBool::new(false)),
             pending_echo: Arc::new(Mutex::new(None)),
+            fence_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -126,6 +130,18 @@ impl PromptTracker {
 
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Relaxed);
+    }
+
+    /// Open the turn's code fence if not already open. Returns true if this call
+    /// opened it (so the caller should prepend the opening ```` ``` ````).
+    pub fn open_fence(&self) -> bool {
+        !self.fence_open.swap(true, Ordering::Relaxed)
+    }
+
+    /// Close the fence, returning whether it was open (so the caller should emit
+    /// the closing ```` ``` ````). Called once per turn after it settles.
+    pub fn take_fence_open(&self) -> bool {
+        self.fence_open.swap(false, Ordering::Relaxed)
     }
 
     /// Block until the shell has finished startup (the sentinel first appeared)

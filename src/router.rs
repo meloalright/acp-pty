@@ -87,7 +87,7 @@ impl SessionRouter {
         match parse_command(text) {
             Some(Command::Stop) => {
                 self.stop_session(session_id)?;
-                send_update(&self.stdout_tx, session_id, "shell terminated");
+                send_block(&self.stdout_tx, session_id, "shell terminated");
                 Ok(())
             }
             Some(Command::CtrlC) => {
@@ -96,7 +96,7 @@ impl SessionRouter {
                     .get(session_id)
                     .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
                 state.session.send_signal(2)?; // SIGINT
-                send_update(&self.stdout_tx, session_id, "SIGINT sent");
+                send_block(&self.stdout_tx, session_id, "SIGINT sent");
                 Ok(())
             }
             None => {
@@ -130,6 +130,11 @@ impl SessionRouter {
                         Duration::from_secs(self.config.session.settle_hard_limit_secs),
                     )
                     .await;
+                // Close the turn's code fence (opened in emit_step), regardless
+                // of how it settled (prompt match / idle / hard limit).
+                if prompt_tracker.take_fence_open() {
+                    send_text(&self.stdout_tx, session_id, "```");
+                }
                 Ok(())
             }
         }
@@ -158,8 +163,11 @@ impl SessionRouter {
     }
 }
 
-fn send_update(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
-    let wrapped = format!("```\n{}\n```", text.trim_end());
+/// Send a raw `agent_message_chunk`. cc-connect accumulates a turn's chunks
+/// into one message, so a turn's output forms a single fenced code block by
+/// opening the fence on the first chunk and closing it at settle (see
+/// `emit_step`) — rather than fencing every chunk, which stacks `` ``` ``.
+fn send_text(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
     let msg = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -167,11 +175,21 @@ fn send_update(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
             "sessionId": session_id,
             "update": {
                 "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": wrapped}
+                "content": {"type": "text", "text": text}
             }
         }
     });
     stdout_tx.send(msg.to_string()).ok();
+}
+
+/// Send a standalone one-off message as its own fenced block (status notices
+/// like "SIGINT sent", "shell exited").
+fn send_block(stdout_tx: &StdoutTx, session_id: &str, text: &str) {
+    send_text(
+        stdout_tx,
+        session_id,
+        &format!("```\n{}\n```", text.trim_end()),
+    );
 }
 
 /// Render newly-finalized terminal rows, emit them to the user, and run
@@ -203,7 +221,13 @@ fn emit_step(
         let display = prompt_tracker.strip_pending_echo(&display);
         if !display.trim().is_empty() {
             let display = truncate_if_needed(&display, max_output_buffer);
-            send_update(stdout_tx, session_id, &display);
+            // First chunk of the turn opens the code fence; subsequent chunks
+            // are raw, so cc-connect accumulates them into one block.
+            if prompt_tracker.open_fence() {
+                send_text(stdout_tx, session_id, &format!("```\n{}", display));
+            } else {
+                send_text(stdout_tx, session_id, &display);
+            }
         }
     }
 
@@ -274,6 +298,10 @@ async fn output_read_loop(
     }
 
     sessions.remove(&session_id);
-    send_update(&stdout_tx, &session_id, "shell exited");
+    // If the shell died mid-turn with an open fence, close it first.
+    if prompt_tracker.take_fence_open() {
+        send_text(&stdout_tx, &session_id, "```");
+    }
+    send_block(&stdout_tx, &session_id, "shell exited");
     prompt_tracker.force_complete();
 }

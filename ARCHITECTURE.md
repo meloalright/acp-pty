@@ -199,6 +199,8 @@ session/update notification → cc-connect → IM
 
 **为什么不在 shell-acp 做消息分片**：cc-connect 已经做了，而且它知道各平台的具体限制。shell-acp 只需要输出合理大小的文本块（≤ 8KB），cc-connect 会处理剩下的。
 
+**代码块围栏(single fence per turn)**:cc-connect 会把一轮内的多个 chunk **累加**进同一条消息。若每个 chunk 各包一对 ```` ``` ````,累加后相邻围栏会叠成 `` `````` ``。所以改为:本轮**第一个**输出 chunk 才前置开围栏,中间 chunk 发原文,本轮 settle 后(`handle_prompt` 里,覆盖提示符匹配/静默/硬上限三种结束)补一个闭围栏。于是 `ping` 这种多 chunk 流式输出也只渲染成**一个**代码块。
+
 ### session/prompt 的 RPC 返回时机
 
 cc-connect 把 `session/prompt` RPC 返回当作**本轮结束信号**（触发 `EventResult(Done=true)`，finalize IM 消息）。所以 shell-acp 不能立即返回,必须等 PTY 输出稳定后再返回。本轮结束有三个触发条件,**任一满足即返回**:
