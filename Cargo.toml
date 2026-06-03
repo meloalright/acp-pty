@@ -2,6 +2,9 @@
 name = "shell-acp"
 version = "0.0.11"
 edition = "2021"
+license = "MIT"
+description = "A shell exposed as an Agent Client Protocol (ACP) agent"
+repository = "https://github.com/meloalright/shell-acp"
 
 [dependencies]
 portable-pty = "0.8"
