@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/meloalright/shell-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/meloalright/shell-acp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Homebrew](https://img.shields.io/github/v/release/meloalright/shell-acp?label=homebrew-tap&logo=homebrew&color=orange)](https://github.com/meloalright/homebrew-tap/blob/main/Formula/shell-acp.rb)
+[![Homebrew](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmeloalright%2Fhomebrew-tap%2Frefs%2Fheads%2Fmain%2FFormula%2Fshell-acp.rb&search=version%20%22(%3F%3Cversion%3E%5Cd%2B(%3F%3A%5C.%5Cd%2B)%2B)%22&replace=%24%3Cversion%3E&label=homebrew-tap&logo=homebrew&color=f9d094)](https://github.com/meloalright/homebrew-tap/tree/main/Formula/shell-acp.rb)
 [![npm](https://img.shields.io/npm/v/shell-acp.svg?logo=npm&color=red)](https://www.npmjs.com/package/shell-acp)
 
 A shell exposed as an ACP agent.
