@@ -1,0 +1,69 @@
+name: Integration Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  npm-linux:
+    name: "npm (Linux)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install via npm
+        run: npm install -g shell-acp
+      - run: shell-acp --version
+      - run: shell-acp -h
+      - name: ACP smoke test
+        run: node samples/acp-smoke.js
+
+  npm-macos:
+    name: "npm (macOS)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install via npm
+        run: npm install -g shell-acp
+      - run: shell-acp --version
+      - run: shell-acp -h
+      - name: ACP smoke test
+        run: node samples/acp-smoke.js
+
+  brew-macos:
+    name: "Homebrew (macOS)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install via Homebrew
+        run: brew install meloalright/tap/shell-acp
+      - run: shell-acp --version
+      - run: shell-acp -h
+      - name: ACP smoke test
+        run: node samples/acp-smoke.js
+
+  brew-linux:
+    name: "Homebrew (Linux)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Homebrew
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - name: Install via Homebrew
+        run: brew install meloalright/tap/shell-acp
+      - run: shell-acp --version
+      - run: shell-acp -h
+      - name: ACP smoke test
+        run: node samples/acp-smoke.js

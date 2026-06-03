@@ -16,11 +16,11 @@ class ShellAcp < Formula
 
   on_linux do
     on_arm do
-      url "https://github.com/meloalright/shell-acp/releases/download/v__VERSION__/shell-acp-__VERSION__-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/meloalright/shell-acp/releases/download/v__VERSION__/shell-acp-__VERSION__-aarch64-unknown-linux-musl.tar.gz"
       sha256 "__SHA_LIN_ARM__"
     end
     on_intel do
-      url "https://github.com/meloalright/shell-acp/releases/download/v__VERSION__/shell-acp-__VERSION__-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/meloalright/shell-acp/releases/download/v__VERSION__/shell-acp-__VERSION__-x86_64-unknown-linux-musl.tar.gz"
       sha256 "__SHA_LIN_X86__"
     end
   end
