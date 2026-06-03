@@ -22,9 +22,16 @@ It speaks ACP (JSON-RPC 2.0 over stdio), so an ACP client such as [cc-connect](h
 
 ## ⚡ Installation
 
+##### ⚡️ install via homebrew
+
 ```sh
-npm install -g shell-acp                 # npm
-brew install meloalright/tap/shell-acp   # Homebrew
+brew install meloalright/tap/shell-acp
+```
+
+##### ⚡️ install via npm
+
+```sh
+npm install -g shell-acp
 ```
 
 ## 💬 Usage
