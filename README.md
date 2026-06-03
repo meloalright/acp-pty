@@ -9,7 +9,7 @@ A shell exposed as an ACP agent.
 
 It speaks ACP (JSON-RPC 2.0 over stdio), so an ACP client such as [cc-connect](https://github.com/chenhg5/cc-connect) spawns it as a backend and bridges it to Telegram, Lark, Slack, Discord, and more — every message becomes a command, and the output streams back.
 
-> 一款命令行的对外 ACP 实现。可用 ACP 客户端如 [cc-connect](https://github.com/chenhg5/cc-connect) 把它链接至飞书、微信、QQ 等平台 —— 以实现在聊天中运行命令行。
+> 一款命令行的 ACP 实现。可用 ACP 客户端如 [cc-connect](https://github.com/chenhg5/cc-connect) 把它连接至飞书、微信、QQ、电报等 —— 以实现在聊天中运行命令行。
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/f265479c-ff8e-487d-ac94-a8a30d93d2bf" alt="Telegram" width="32%" />
