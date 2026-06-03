@@ -524,7 +524,8 @@ async fn handle_session_prompt(session_id, prompt_text) -> RpcResult {
 - `output_ends_with_prompt()` → `force_complete()` — 输出末尾匹配提示符则立即结束本轮
 - `notify_output()` — output_read_loop 每次 flush 后调用，**重置静默计时器**
 - `wait_for_settle()` — 阻塞直到以下任一:提示符匹配、连续 `idle_window` 无新 `notify_output`、或 `hard_limit` 硬上限
-- `@shell ctrl-c` / `@shell stop` 命令直接完成 tracker，立即返回 RPC
+- `@shell ctrl-c`(0x03)/ `@shell ctrl-d`(0x04)**把真实控制字节写进 PTY**,由 tty 行规程投递给**前台作业**(node/python/ping),而不是 shell——直接 kill shell pid 会打不中前台作业。写完后照常 `wait_for_settle`
+- `@shell stop` 命令销毁 PTY 会话
 
 ## 8. ACP 协议实现
 

@@ -1,6 +1,6 @@
 [package]
 name = "shell-acp"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2021"
 
 [dependencies]
@@ -14,5 +14,4 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
-libc = "0.2"
 vt100 = "0.16.2"

@@ -132,16 +132,6 @@ impl LocalTerminalSession {
         Ok(())
     }
 
-    pub fn send_signal(&self, sig: i32) -> Result<()> {
-        let child = self.child.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-        if let Some(pid) = child.process_id() {
-            unsafe {
-                libc::kill(pid as i32, sig);
-            }
-        }
-        Ok(())
-    }
-
     pub fn kill(&self) {
         if let Ok(mut child) = self.child.lock() {
             child.kill().ok();

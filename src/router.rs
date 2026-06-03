@@ -27,6 +27,7 @@ struct SessionState {
 pub enum Command {
     Stop,
     CtrlC,
+    CtrlD,
 }
 
 pub fn parse_command(text: &str) -> Option<Command> {
@@ -35,6 +36,8 @@ pub fn parse_command(text: &str) -> Option<Command> {
         Some(Command::Stop)
     } else if trimmed.eq_ignore_ascii_case("@shell ctrl-c") {
         Some(Command::CtrlC)
+    } else if trimmed.eq_ignore_ascii_case("@shell ctrl-d") {
+        Some(Command::CtrlD)
     } else {
         None
     }
@@ -90,15 +93,12 @@ impl SessionRouter {
                 send_block(&self.stdout_tx, session_id, "shell terminated");
                 Ok(())
             }
-            Some(Command::CtrlC) => {
-                let state = self
-                    .sessions
-                    .get(session_id)
-                    .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
-                state.session.send_signal(2)?; // SIGINT
-                send_block(&self.stdout_tx, session_id, "SIGINT sent");
-                Ok(())
-            }
+            // Write the real control byte into the PTY, exactly like a terminal:
+            // the tty line discipline delivers it to the foreground job (node,
+            // python, …), not the shell. Ctrl-C (0x03) interrupts; Ctrl-D (0x04)
+            // sends EOF, which exits a REPL/shell in one shot.
+            Some(Command::CtrlC) => self.send_control(session_id, "\u{3}").await,
+            Some(Command::CtrlD) => self.send_control(session_id, "\u{4}").await,
             None => {
                 let prompt_tracker = {
                     let state = self
@@ -138,6 +138,29 @@ impl SessionRouter {
                 Ok(())
             }
         }
+    }
+
+    /// Write a raw control byte to the PTY (e.g. Ctrl-C/Ctrl-D), then let the
+    /// resulting output settle and close the turn's fence.
+    async fn send_control(&self, session_id: &str, bytes: &str) -> Result<()> {
+        let prompt_tracker = {
+            let state = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
+            state.session.write_to_pty(bytes)?;
+            state.session.prompt_tracker.clone()
+        };
+        prompt_tracker
+            .wait_for_settle(
+                Duration::from_millis(self.config.session.settle_idle_ms),
+                Duration::from_secs(self.config.session.settle_hard_limit_secs),
+            )
+            .await;
+        if prompt_tracker.take_fence_open() {
+            send_text(&self.stdout_tx, session_id, "```");
+        }
+        Ok(())
     }
 
     pub fn stop_session(&self, session_id: &str) -> Result<()> {
