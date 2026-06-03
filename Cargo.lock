@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "shell-acp"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "dashmap",
