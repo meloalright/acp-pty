@@ -193,6 +193,8 @@ session/update notification → cc-connect → IM
 
 **为什么用真正的终端模拟器而不是 strip**:`strip_ansi` 只是删转义序列,处理不了 `\r` 覆盖(进度条)、光标定位、清屏、ZLE 重绘——删完会留下乱码。`vt100` 把字节流**渲染到一块屏幕网格**,我们读回渲染后的纯文本,这些都被正确处理。
 
+**全屏 TUI(alt-screen)兜底**:像 `opencode`(默认 TUI)、vim、htop、lazygit 这类程序会切到**备用屏**(`\e[?1049h`),在固定网格上原地重绘、永不回到 shell 提示符、且要逐键输入——根本不适合"一轮一条 IM 消息"的模型。`term.rs` 用 `screen.alternate_screen()` 检测到进入备用屏后,`emit_step` **不再喷重绘乱码**,而是发一条提示并**只 force_complete 一次**结束本轮(多次会留下 `completed` 余票,导致下一轮提前 settle)。用户用非交互模式(`opencode run "..."`)或 `@shell ctrl-c`/`ctrl-d`/`stop` 退出;真 TUI 退出时会发 `\e[?1049l` 还原主屏,会话自动恢复。
+
 **与 cc-connect 的分工**：
 - shell-acp 负责：终端模拟渲染、判断"本轮输出结束"、语义截断
 - cc-connect 负责：消息分片（4000 rune）、流式预览编辑、平台 API 调用

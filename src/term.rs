@@ -30,6 +30,13 @@ impl TermRenderer {
         self.parser.process(bytes);
     }
 
+    /// True when a full-screen program has switched to the alternate screen
+    /// (vim, htop, opencode's TUI, …). Such programs redraw a fixed grid in
+    /// place and never finalize lines, so streaming them is meaningless.
+    pub fn in_alt_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     fn cursor_row(&self) -> usize {
         self.parser.screen().cursor_position().0 as usize
     }

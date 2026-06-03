@@ -223,6 +223,7 @@ fn emit_step(
     stdout_tx: &StdoutTx,
     session_id: &str,
     max_output_buffer: usize,
+    alt_notified: &mut bool,
 ) {
     // Startup gate: drop everything until the sentinel prompt first renders, so
     // the shell coming up + our init line are never shown. The watchdog also
@@ -234,6 +235,29 @@ fn emit_step(
         }
         return;
     }
+
+    // Full-screen TUI (alternate screen): can't be shown over chat — it redraws
+    // a fixed grid forever and never settles. Notify once, end the turn, and let
+    // the user exit. Don't stream the redraw garbage.
+    if renderer.in_alt_screen() {
+        if !*alt_notified {
+            *alt_notified = true;
+            if prompt_tracker.take_fence_open() {
+                send_text(stdout_tx, session_id, "```");
+            }
+            send_text(
+                stdout_tx,
+                session_id,
+                "⚠️ 这个程序启动了全屏界面(TUI),无法在聊天里呈现。\n请用它的非交互模式(如 `opencode run \"...\"`),或发 `@shell ctrl-c` / `@shell ctrl-d` / `@shell stop` 退出。",
+            );
+            // End this turn exactly once. Calling it on every alt-screen tick
+            // would leave stale `completed` permits that settle the next real
+            // turn prematurely.
+            prompt_tracker.force_complete();
+        }
+        return;
+    }
+    *alt_notified = false;
 
     // Finalized rows above the cursor are the command output. Redact the
     // sentinel (in case the command line itself carried the prompt) and strip
@@ -283,6 +307,7 @@ async fn output_read_loop(
     max_output_buffer: usize,
 ) {
     let mut renderer = TermRenderer::new();
+    let mut alt_notified = false;
     let flush_interval = Duration::from_millis(100);
 
     // Readiness watchdog: if the sentinel never appears (integration failed, or
@@ -309,13 +334,13 @@ async fn output_read_loop(
                         renderer.feed(&data);
                     }
                     None => {
-                        emit_step(&mut renderer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
+                        emit_step(&mut renderer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut alt_notified);
                         break;
                     }
                 }
             }
-            _ = tokio::time::sleep(flush_interval), if renderer.pending() || !prompt_tracker.is_ready() => {
-                emit_step(&mut renderer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer);
+            _ = tokio::time::sleep(flush_interval), if renderer.pending() || renderer.in_alt_screen() || !prompt_tracker.is_ready() => {
+                emit_step(&mut renderer, &prompt_tracker, &stdout_tx, &session_id, max_output_buffer, &mut alt_notified);
             }
         }
     }
