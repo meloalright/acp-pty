@@ -4,66 +4,66 @@ on:
   workflow_dispatch:
 
 jobs:
-  npm-linux:
-    name: "npm (Linux)"
-    runs-on: ubuntu-latest
+  install-and-run:
+    name: "${{ matrix.method }} (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        method: [npm, brew]
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Install via npm
-        run: npm install -g shell-acp
-      - run: shell-acp --version
-      - run: shell-acp -h
-      - name: ACP smoke test
-        run: node samples/acp-smoke.js
 
-  npm-macos:
-    name: "npm (macOS)"
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Install via npm
-        run: npm install -g shell-acp
-      - run: shell-acp --version
-      - run: shell-acp -h
-      - name: ACP smoke test
-        run: node samples/acp-smoke.js
-
-  brew-macos:
-    name: "Homebrew (macOS)"
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Install via Homebrew
-        run: brew install meloalright/tap/shell-acp
-      - run: shell-acp --version
-      - run: shell-acp -h
-      - name: ACP smoke test
-        run: node samples/acp-smoke.js
-
-  brew-linux:
-    name: "Homebrew (Linux)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Install Homebrew
+      - name: Install Homebrew (Linux)
+        if: matrix.method == 'brew' && matrix.os == 'ubuntu-latest'
         run: |
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
+      - name: Install via npm
+        if: matrix.method == 'npm'
+        run: npm install -g shell-acp
+
       - name: Install via Homebrew
+        if: matrix.method == 'brew'
         run: brew install meloalright/tap/shell-acp
+
       - run: shell-acp --version
       - run: shell-acp -h
+
       - name: ACP smoke test
-        run: node samples/acp-smoke.js
+        run: |
+          node <<'NODE'
+          // Drive the installed shell-acp over ACP and assert a command's
+          // output streams back.
+          const { spawn } = require("child_process");
+          const MARK = "shell-acp-smoke-ok";
+          const p = spawn("shell-acp", [], { stdio: ["pipe", "pipe", "inherit"] });
+          let buf = "", done = false;
+          const send = (o) => p.stdin.write(JSON.stringify(o) + "\n");
+          const fail = (m) => { console.error("SMOKE FAIL:", m); try { p.kill(); } catch {} process.exit(1); };
+          const timer = setTimeout(() => fail("timed out waiting for output"), 25000);
+          p.on("error", (e) => fail("spawn: " + e.message));
+          p.on("exit", (c) => { if (!done) fail("process exited early, code=" + c); });
+          p.stdout.on("data", (d) => {
+            buf += d;
+            let i;
+            while ((i = buf.indexOf("\n")) >= 0) {
+              const line = buf.slice(0, i); buf = buf.slice(i + 1);
+              let m; try { m = JSON.parse(line); } catch { continue; }
+              if (m.id === 2 && m.result && m.result.sessionId)
+                send({ jsonrpc: "2.0", id: 3, method: "session/prompt",
+                       params: { sessionId: m.result.sessionId, prompt: [{ type: "text", text: "echo " + MARK }] } });
+              if (m.method === "session/update" && (m.params?.update?.content?.text || "").includes(MARK)) {
+                done = true; clearTimeout(timer);
+                console.log("SMOKE OK: shell-acp ran a command and streamed output back");
+                try { p.kill(); } catch {} process.exit(0);
+              }
+            }
+          });
+          send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+          setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: process.cwd() } }), 300);
+          NODE
