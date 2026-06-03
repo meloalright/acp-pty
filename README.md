@@ -16,7 +16,7 @@ It speaks ACP (JSON-RPC 2.0 over stdio), so an ACP client such as [cc-connect](h
   <img src="https://github.com/user-attachments/assets/aec62230-b0a6-4fe8-ba31-044385f0fc5b" alt="飞书" width="32%" />
 </p>
 <p align="center">
-  <em>Left: Telegram &nbsp;|&nbsp; Right: 飞书</em>
+  <em>Left: Telegram &nbsp;|&nbsp; Right: Lark</em>
 </p>
 
 
