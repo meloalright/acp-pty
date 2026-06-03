@@ -1,6 +1,6 @@
 {
   "name": "shell-acp",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "description": "A shell exposed as an Agent Client Protocol (ACP) agent",
   "homepage": "https://github.com/meloalright/shell-acp",
   "repository": {
