@@ -20,7 +20,7 @@ It speaks ACP (JSON-RPC 2.0 over stdio), so an ACP client such as [cc-connect](h
 </p>
 
 
-## ⚡ Installation
+## Installation
 
 ##### ⚡️ install via homebrew
 
@@ -34,7 +34,7 @@ brew install meloalright/tap/shell-acp
 npm install -g shell-acp
 ```
 
-## 💬 Usage
+## Usage
 
 Add it to your cc-connect `config.toml` as an `acp` agent:
 
