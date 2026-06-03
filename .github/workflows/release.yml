@@ -58,7 +58,7 @@ jobs:
           NAME="shell-acp-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
           cp "target/${{ matrix.target }}/release/shell-acp" "dist/${NAME}/"
-          cp config.example.toml ARCHITECTURE.md "dist/${NAME}/" 2>/dev/null || true
+          cp ARCHITECTURE.md "dist/${NAME}/" 2>/dev/null || true
           tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
           ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
 

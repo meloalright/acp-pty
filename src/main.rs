@@ -23,7 +23,7 @@ USAGE:
 
 OPTIONS:
     --config <path>    Path to a TOML config (targets + session settings).
-                       Omitted: sensible defaults (see config.example.toml).
+                       Omitted: sensible defaults apply.
     -h, --help         Print this help and exit.
     -V, --version      Print version and exit.
 

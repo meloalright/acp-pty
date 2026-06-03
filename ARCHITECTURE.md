@@ -358,7 +358,6 @@ shell-acp/
 │   └── config.rs            # TOML 配置加载
 │       ├── Config
 │       └── TargetConfig
-├── config.example.toml
 └── Cargo.toml
 ```
 
