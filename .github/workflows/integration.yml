@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        method: [npm, brew]
+        method: [brew, cargo]
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -23,13 +23,15 @@ jobs:
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
 
-      - name: Install via npm
-        if: matrix.method == 'npm'
-        run: npm install -g shell-acp
-
       - name: Install via Homebrew
         if: matrix.method == 'brew'
         run: brew install meloalright/tap/shell-acp
+
+      - name: Install via cargo
+        if: matrix.method == 'cargo'
+        run: |
+          cargo install --git https://github.com/meloalright/shell-acp.git
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - run: shell-acp --version
       - run: shell-acp -h

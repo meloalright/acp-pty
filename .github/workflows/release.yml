@@ -140,38 +140,3 @@ jobs:
             git commit -m "shell-acp ${GITHUB_REF_NAME#v}"
             git push
           fi
-
-  npm:
-    name: Publish to npm
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      # install.js downloads the matching binary from the GitHub Release at the
-      # user's install time, so the release assets must already be published.
-      - name: Wait for release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for i in $(seq 1 30); do
-            n=$(gh release view "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" --json assets -q '.assets | length')
-            [ "$n" -ge 4 ] && echo "assets ready ($n)" && break
-            echo "waiting for assets ($n)... ($i/30)"; sleep 10
-          done
-
-      - name: Set version and publish
-        working-directory: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          node -e "const p=require('./package.json');p.version='${VERSION}';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
-          cat package.json
-          npm publish --access public
